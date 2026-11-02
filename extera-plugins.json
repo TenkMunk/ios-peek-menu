@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "name": "iOS Peek & Context Menu",
+  "description": "An iOS-inspired message peek and context menu for exteraGram.",
+  "author": "@tenkmunk",
+  "homepage": "https://github.com/TenkMunk/ios-peek-menu",
+  "plugins": [
+    {
+      "id": "ios_peek_menu",
+      "name": "iOS Peek & Context Menu",
+      "description": "Telegram message peek with bubble-focused spring motion, frosted glass styling, reaction shortcuts, and haptics.",
+      "author": "@tenkmunk",
+      "version": "2.2.0",
+      "icon": "exteraPlugins/1",
+      "app_version": ">=12.5.1",
+      "sdk_version": ">=1.4.4.3",
+      "file": "ios_peek_menu.plugin",
+      "sha256": "1d3046591979fcb074afaf65e226a1cdcc31058583e4097363c23701549df4ce",
+      "size": 169669
+    }
+  ]
+}

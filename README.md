@@ -20,6 +20,10 @@ An iOS-inspired message peek and context menu plugin for exteraGram. It adds a b
 
 These are the compatibility values declared by the plugin. Device and app builds can still affect individual hooks.
 
+## Add through the exteraGram catalog
+
+[Add this repository to exteraGram](https://t.me/exteraPluginRepo?git=https%3A%2F%2Fgithub.com%2FTenkMunk%2Fios-peek-menu). The repository index is `extera-plugins.json`.
+
 ## Install
 
 Download `ios_peek_menu.plugin` from the latest GitHub Release and import it through your exteraGram plugin loader.
