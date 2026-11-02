@@ -1,0 +1,3582 @@
+# -*- coding: utf-8 -*-
+"""
+iOS Peek menu 2.2.0 for exteraGram 12.5.1+ / SDK 1.4.4.3.
+Native permission-aware actions, persistent tap menu, optional slide selection,
+scrollable cards, bubble-focused previews, reduced motion and frosted snapshot blur.
+Motion adapted from Telegram-iOS fb0e62ba8a14; see the accompanying motion notes.
+Compatibility failure leaves Telegram's original menu available.
+"""
+
+from typing import Any, List, Optional
+import time
+import weakref
+import math
+
+# exteraGram SDK Imports
+from base_plugin import BasePlugin, MethodHook
+from ui.settings import Header, Switch, Divider, Selector, Text
+from hook_utils import find_class, get_private_field, set_private_field, jclass
+from android_utils import run_on_ui_thread, log, copy_to_clipboard, R
+
+# Chaquopy Java Interop
+from java import dynamic_proxy, jarray, jint, jboolean, jfloat, jdouble, jlong, jshort, jbyte, jchar
+
+# Required Android classes exist on the supported exteraGram baseline.
+from android.view import View, ViewGroup, MotionEvent, KeyEvent, Gravity, HapticFeedbackConstants
+from android.view.animation import OvershootInterpolator, DecelerateInterpolator, LinearInterpolator
+from android.widget import FrameLayout, LinearLayout, TextView, ImageView, ScrollView, Toast
+from android.graphics import Color, Bitmap, Canvas, Rect
+from android.graphics.drawable import GradientDrawable
+from android.os import Build, Looper
+
+try:
+    from org.telegram.messenger import AndroidUtilities
+    from org.telegram.ui.ActionBar import Theme
+except Exception as _tg_import_error:
+    print(f"[peek] telegram class import failed: {_tg_import_error}")
+    try:
+        from client_utils import AndroidUtilities
+    except Exception:
+        AndroidUtilities = None
+    try:
+        Theme = find_class("org.telegram.ui.ActionBar.Theme")
+    except Exception:
+        Theme = None
+
+try:
+    from android.graphics import RenderEffect, Shader
+except Exception:
+    RenderEffect = None
+    Shader = None
+
+# --- Plugin Metadata (Parsed statically by exteraGram loader) ---
+__id__ = "ios_peek_menu"
+__name__ = "iOS Peek & Context Menu"
+__description__ = "Telegram message peek with bubble-focused spring motion, frosted glass styling, reaction shortcuts, and haptics."
+__author__ = "@tenkmunk"
+__version__ = "2.2.0"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.4.3"
+
+# Telegram Option Constants from ChatActivity
+OPTION_DELETE = 1
+OPTION_FORWARD = 2
+OPTION_COPY = 3
+OPTION_SAVE_TO_GALLERY = 4
+OPTION_SAVE_TO_GALLERY2 = 7
+OPTION_REPLY = 8
+OPTION_SAVE_TO_DOWNLOADS_OR_MUSIC = 10
+OPTION_ADD_TO_GIFS = 11
+OPTION_EDIT = 12
+OPTION_PIN = 13
+OPTION_UNPIN = 14
+
+# Global active session reference for singleton overlay control
+_active_session: Optional["PeekMenuSession"] = None
+# Non-fatal problems collected during the current session. These used to be
+# swallowed by 170+ `except Exception: pass` blocks, which is exactly why a
+# plugin that did nothing at all looked identical to a working one. Read them
+# from the log after any failed peek.
+_diagnostics: List[str] = []
+_load_diagnostics: List[str] = []
+_method_cache = {}
+_cell_class = None
+_diag_once_keys = set()
+
+# Telegram-iOS / ContextControllerExtractedPresentationNode + ContextSourceContainer.
+# These are source timings, not measurements of an iPhone screen recording.
+IOS_OPEN_MS = 420
+IOS_BACKDROP_MS = 200
+IOS_ACTION_FADE_MS = 50
+IOS_CLOSE_MS = 200
+IOS_REACTION_MS = 400
+_motion_interpolators = {}
+
+
+def _spring_progress(fraction, damping=104.0):
+    """Unit step of the iOS mass=5, stiffness=900 spring, with zero velocity.
+
+    Core Animation's settlingDuration is platform-defined. Normalize an analytic
+    0.1% envelope to the requested Android duration; the clock is an adaptation.
+    The small physical overshoot is retained instead of adding an arbitrary bounce.
+    """
+    fraction = max(0.0, min(1.0, float(fraction)))
+    if fraction == 0.0 or fraction == 1.0:
+        return fraction
+    mass, stiffness = 5.0, 900.0
+    decay = float(damping) / (2.0 * mass)
+    frequency = math.sqrt(stiffness / mass - decay * decay)
+    envelope = math.sqrt(1.0 + (decay / frequency) ** 2)
+    settle_time = math.log(envelope / 0.001) / decay
+    t = fraction * settle_time
+    return 1.0 - math.exp(-decay * t) * (
+        math.cos(frequency * t) + decay / frequency * math.sin(frequency * t))
+
+
+def _ios_interpolator(kind="spring"):
+    """Sample once into an Android PathInterpolator: no Python frame callbacks."""
+    cached = _motion_interpolators.get(kind)
+    if cached is not None:
+        return cached
+    try:
+        cls = jclass("android.view.animation.PathInterpolator")
+        if kind == "ease":
+            interpolator = cls(jfloat(0.42), jfloat(0.0), jfloat(0.58), jfloat(1.0))
+        else:
+            path = jclass("android.graphics.Path")()
+            path.moveTo(jfloat(0.0), jfloat(0.0))
+            damping = 88.0 if kind == "reaction" else 104.0
+            for i in range(1, 161):
+                fraction = i / 160.0
+                path.lineTo(jfloat(fraction), jfloat(_spring_progress(fraction, damping)))
+            interpolator = cls(path)
+    except Exception as error:
+        diag_once("motion-curve:" + kind, f"native motion curve unavailable; using fallback: {error}")
+        interpolator = DecelerateInterpolator() if kind == "ease" else OvershootInterpolator(0.7)
+    _motion_interpolators[kind] = interpolator
+    return interpolator
+
+
+def diag_once(key, message):
+    if key not in _diag_once_keys:
+        _diag_once_keys.add(key)
+        diag(message)
+
+
+def load_diag(message):
+    _load_diagnostics.append(str(message))
+    del _load_diagnostics[:-40]
+    diag(message)
+
+
+_UI_TEXT = {'General': ('Загальне', 'Общее'),
+ 'Enable iOS Peek & Pop Menu': ('Увімкнути меню iOS Peek', 'Включить меню iOS Peek'),
+ 'Replaces default long press menu with iOS-style overlay': ('Меню в стилі iOS після довгого '
+                                                             'натискання',
+                                                             'Меню в стиле iOS при долгом нажатии'),
+ 'Floating Reaction Bar': ('Панель реакцій', 'Панель реакций'),
+ 'Display quick reaction emoji pill above or below message': ('Швидкі реакції біля повідомлення',
+                                                              'Быстрые реакции рядом с сообщением'),
+ 'Haptic Intensity': ('Сила вібровідгуку', 'Сила виброотклика'),
+ 'Off': ('Вимкнено', 'Выключено'),
+ 'Light': ('Легка', 'Лёгкая'),
+ 'Medium': ('Середня', 'Средняя'),
+ 'Strong': ('Сильна', 'Сильная'),
+ 'Appearance & Physics': ('Вигляд і анімація', 'Вид и анимация'),
+ 'Reduce motion': ('Зменшити рух', 'Уменьшить движение'),
+ 'Show and dismiss immediately without spring animations': ('Відкривати й закривати без анімацій',
+                                                            'Открывать и закрывать без анимаций'),
+ 'Slide to select': ('Вибір ковзанням', 'Выбор скольжением'),
+ 'Drag across actions; compact screens use scrolling instead': ('Проведіть по діях; на малому '
+                                                                'екрані працює прокручування',
+                                                                'Проведите по действиям; на малом '
+                                                                'экране работает прокрутка'),
+ 'Frosted Background Blur': ('Розмиття тла', 'Размытие фона'),
+ 'Hardware accelerated blur behind overlay (Android 12+)': ('Розмиття тла з апаратним прискоренням '
+                                                            '(Android 12+)',
+                                                            'Размытие фона с аппаратным ускорением '
+                                                            '(Android 12+)'),
+ 'Blur Intensity': ('Сила розмиття', 'Сила размытия'),
+ 'Subtle': ('Ледь помітне', 'Слабое'),
+ 'Heavy / iOS': ('Сильне / iOS', 'Сильное / iOS'),
+ 'Extreme': ('Максимальне', 'Максимальное'),
+ 'Spring Overshoot Physics': ('Пружна анімація', 'Пружинная анимация'),
+ 'Fluid iOS-style bounce animation on menu appearance': ('Пружна анімація відкриття в стилі iOS',
+                                                         'Пружинная анимация открытия в стиле iOS'),
+ 'Copy diagnostics': ('Копіювати діагностику', 'Копировать диагностику'),
+ 'Diagnostics copied': ('Діагностику скопійовано', 'Диагностика скопирована'),
+ 'Message actions': ('Дії з повідомленням', 'Действия с сообщением'),
+ 'Message preview': ('Перегляд повідомлення', 'Просмотр сообщения'),
+ 'More actions…': ('Інші дії…', 'Другие действия…'),
+ 'Select': ('Вибрати', 'Выбрать'),
+ 'React': ('Реагувати', 'Реагировать'),
+ 'Selected reaction — tap to remove': ('Обрана реакція — натисніть, щоб прибрати',
+                                       'Выбранная реакция — нажмите, чтобы убрать'),
+ 'Native menu arguments are unavailable. Long-press again.': ('Не вдалося відкрити меню. Натисніть '
+                                                              'повідомлення ще раз.',
+                                                              'Не удалось открыть меню. Нажмите '
+                                                              'сообщение ещё раз.'),
+ 'Could not open native menu. Long-press the message again.': ('Не вдалося відкрити меню Telegram. '
+                                                               'Знову затисніть повідомлення.',
+                                                               'Не удалось открыть меню Telegram. '
+                                                               'Снова зажмите сообщение.'),
+ 'This reaction is no longer available here.': ('Ця реакція тут більше недоступна.',
+                                                'Эта реакция здесь больше недоступна.'),
+ 'Reaction unavailable. Try More actions for Telegram’s reaction picker.': ('Реакція недоступна. '
+                                                                            'Відкрийте інші дії, '
+                                                                            'щоб обрати реакцію в '
+                                                                            'Telegram.',
+                                                                            'Реакция недоступна. '
+                                                                            'Откройте другие '
+                                                                            'действия для выбора '
+                                                                            'реакции в Telegram.'),
+ 'The message moved. Long-press it again to open its menu.': ('Повідомлення перемістилося. '
+                                                              'Затисніть його знову.',
+                                                              'Сообщение переместилось. Зажмите '
+                                                              'его снова.'),
+ 'This action is no longer available for this message.': ('Ця дія більше недоступна для '
+                                                          'повідомлення.',
+                                                          'Это действие больше недоступно для '
+                                                          'сообщения.'),
+ 'Action could not run. Long-press again and choose More actions.': ('Дія не виконалася. Затисніть '
+                                                                     'повідомлення й відкрийте '
+                                                                     'інші дії.',
+                                                                     'Действие не выполнено. '
+                                                                     'Зажмите сообщение и откройте '
+                                                                     'другие действия.'),
+ 'Action unavailable. Try More actions.': ('Дія недоступна. Відкрийте інші дії.',
+                                           'Действие недоступно. Откройте другие действия.'),
+ 'Peek could not open. Copy diagnostics from the plugin settings.': ('Меню Peek не відкрилося. '
+                                                                     'Скопіюйте діагностику в '
+                                                                     'налаштуваннях плагіна.',
+                                                                     'Меню Peek не открылось. '
+                                                                     'Скопируйте диагностику в '
+                                                                     'настройках плагина.')}
+
+
+def ui_text(text):
+    try:
+        locale = jclass("org.telegram.messenger.LocaleController").getInstance().getCurrentLocaleInfo()
+        language = str(_read_field(locale, "shortName", "en")).replace("-", "_").split("_")[0]
+        entry = _UI_TEXT.get(text)
+        if entry and language in ("uk", "ru"):
+            return entry[0 if language == "uk" else 1]
+    except Exception as error:
+        diag_once("plugin-locale", f"plugin locale unavailable; using English fallback: {error}")
+    return text
+
+
+def tr(key, fallback):
+    """Use Telegram resources where present; optional keys must fail safely."""
+    try:
+        resources = jclass("org.telegram.messenger.R$string")
+        resource = getattr(resources, key)
+        value = str(jclass("org.telegram.messenger.LocaleController").getString(resource))
+        if value and not value.startswith("LOC_ERR"):
+            return value
+    except Exception as error:
+        diag_once("locale:" + key, f"locale {key}: using English fallback ({error})")
+    return ui_text(fallback)
+
+
+def _motion_reduced(plugin, context=None):
+    if plugin is not None and plugin.get_setting("reduce_motion", False):
+        return True
+    try:
+        if Build.VERSION.SDK_INT >= 26:
+            return not jclass("android.animation.ValueAnimator").areAnimatorsEnabled()
+        if context is not None:
+            settings = jclass("android.provider.Settings$Global")
+            return settings.getFloat(context.getContentResolver(), settings.ANIMATOR_DURATION_SCALE, 1.0) == 0.0
+    except Exception as error:
+        diag_once("motion-scale", f"system motion preference unavailable: {error}")
+    return False
+
+
+def _chosen_emojis(message):
+    results = _read_field(_read_field(_read_field(message, "messageOwner"), "reactions"), "results", [])
+    return {_reaction_key(_read_field(r, "reaction"))
+            for r in _java_array_to_list(results) if _read_field(r, "chosen", False)} - {""}
+
+
+def _reaction_key(reaction):
+    if isinstance(reaction, str):
+        return reaction
+    emoji = _read_field(reaction, "emoticon", _read_field(reaction, "emojicon", ""))
+    if emoji:
+        return str(emoji)
+    document = _read_field(reaction, "document_id", _read_field(reaction, "documentId", 0))
+    try:
+        return "animated_" + str(int(document)) if int(document) > 0 else ""
+    except Exception as error:
+        diag_once("custom-id", f"invalid custom reaction document id: {error}")
+        return ""
+
+
+def _visible_reaction(key):
+    """Resolve a factory's exact signature; never send an empty emoticon."""
+    if not key:
+        return None
+    try:
+        factory = find_class("org.telegram.ui.Components.Reactions.ReactionsLayoutInBubble$VisibleReaction")
+        if key.startswith("animated_"):
+            document = int(key[9:])
+            if document <= 0:
+                return None
+            method = _find_declared_method(factory, "fromCustomEmoji", 1, ["java.lang.Long"])
+            argument = jlong(document)
+        else:
+            method = _find_declared_method(factory, "fromEmojicon", 1, ["java.lang.String"])
+            argument = key
+        if method is None:
+            return None
+        # This query returns an object, so the three-state void/action helper
+        # cannot supply its value. Invoke once; any failure skips this reaction.
+        return method.invoke(None, jarray(jclass("java.lang.Object"))([argument]))
+    except Exception as error:
+        diag(f"reaction factory unavailable for {key}: {error}")
+        return None
+
+
+
+def diag(msg: str) -> None:
+    """Record a non-fatal failure. Visible in logcat, never silently dropped."""
+    try:
+        _diagnostics.append(str(msg))
+        del _diagnostics[:-100]
+    except Exception:
+        pass
+    try:
+        log(f"[peek][diag] {msg}")
+    except Exception:
+        pass
+
+
+def diag_dump() -> str:
+    return (f"iOS Peek {__version__}\nLoad / hooks:\n" + "\n".join(_load_diagnostics)
+            + "\nRecent events:\n" + "\n".join(_diagnostics[-60:]))
+
+
+OPTION_NATIVE_MENU = -1000
+OPTION_SELECT_MESSAGE = -1001
+
+
+def safe_to_list(val: Any) -> list:
+    """Safely converts Python iterables, Chaquopy Java Collections (ArrayList,
+    List, Set), or Java arrays to a clean Python list of strings without
+    raising 'TypeError: ArrayList object is not iterable'.
+    """
+    if val is None:
+        return []
+    # Chaquopy Java Collection (java.util.List / ArrayList) with size() and get(int)
+    try:
+        if hasattr(val, "size") and hasattr(val, "get") and callable(val.size) and callable(val.get):
+            sz = int(val.size())
+            res = []
+            for i in range(sz):
+                elem = val.get(i)
+                if elem is not None:
+                    res.append(str(elem))
+            return res
+    except Exception:
+        pass
+    # Python list or tuple
+    if isinstance(val, (list, tuple)):
+        res = []
+        for elem in val:
+            if elem is not None:
+                res.append(str(elem))
+        return res
+    # Generic iterable (excluding strings and mappings)
+    if not isinstance(val, (str, bytes, dict)):
+        try:
+            res = []
+            for elem in val:
+                if elem is not None:
+                    res.append(str(elem))
+            return res
+        except Exception:
+            pass
+    return []
+
+
+def _now_ms() -> float:
+    return time.monotonic() * 1000.0
+
+
+def _is_java_instance(obj: Any, java_class: Any) -> bool:
+    """Accept both java.lang.Class and Chaquopy JavaClass SDK results."""
+    if obj is None or java_class is None:
+        return False
+    try:
+        if java_class.isInstance(obj):
+            return True
+    except Exception:
+        pass
+    try:
+        if isinstance(obj, java_class):
+            return True
+    except Exception:
+        pass
+    try:
+        target = str(java_class.getName())
+    except Exception:
+        target = str(getattr(java_class, "__name__", ""))
+    if not target:
+        return False
+    try:
+        current = obj.getClass()
+        for _ in range(64):
+            if current is None:
+                break
+            name = str(current.getName())
+            if name == target or ("." not in target and name.rsplit(".", 1)[-1] == target):
+                return True
+            current = current.getSuperclass()
+    except Exception:
+        pass
+    return False
+
+
+def _action_mode_showed(chat_activity: Any) -> bool:
+    action_bar = _message_call(chat_activity, "getActionBar", _read_field(chat_activity, "actionBar"))
+    if action_bar is None:
+        return False
+    try:
+        return bool(action_bar.isActionModeShowed())
+    except Exception as error:
+        diag_once("action-mode", f"action mode check unavailable: {error}")
+        return False
+
+
+def should_suppress_select(owner: Any = None) -> bool:
+    session = _active_session
+    if session is None or not session.is_attached():
+        return False
+    chat = session.chat_activity_owner() if session.chat_activity_owner else None
+    return owner is None or owner == chat or owner == session._chat_list or owner == _read_field(chat, "chatListView")
+
+
+def haptic_level_for(plugin: Any) -> int:
+    """0=Off, 1=Light, 2=Medium, 3=Strong. Migrates the legacy
+    enable_haptics switch (False -> Off) for existing installs."""
+    try:
+        if plugin is None:
+            return 2
+        level = plugin.get_setting("haptic_intensity", None)
+        if level is None:
+            legacy = plugin.get_setting("enable_haptics", True)
+            return 2 if legacy else 0
+        level = int(level)
+        return max(0, min(3, level))
+    except Exception:
+        return 2
+
+
+def do_haptic(view: Any, kind: str = "tap", level: int = 2) -> None:
+    if view is None or level <= 0:
+        return
+    try:
+        # One constant per level, so Light differs from Medium for taps and
+        # hover ticks. Medium (the default) keeps its previous feedback.
+        H = HapticFeedbackConstants
+        level = min(3, level)
+        if kind == "show":
+            preferred = H.LONG_PRESS if level > 1 else H.KEYBOARD_TAP
+        elif kind == "heavy":
+            preferred = (H.KEYBOARD_TAP, H.CONTEXT_CLICK, H.LONG_PRESS)[level - 1]
+        else:
+            preferred = (H.CLOCK_TICK, H.KEYBOARD_TAP, H.CONTEXT_CLICK)[level - 1]
+        if not view.performHapticFeedback(preferred):
+            view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+    except Exception as error:
+        diag_once("haptic", f"haptic feedback unavailable: {error}")
+
+
+def is_session_active() -> bool:
+    global _active_session
+    return _active_session is not None and _active_session.is_active()
+
+
+def dismiss_active_session(animated: bool = True) -> None:
+    global _active_session
+    if _active_session is not None:
+        session = _active_session
+        session.dismiss(animated=animated)
+
+
+# --- Standalone Dynamic Proxy Listeners (Avoid circular closures & leaks) ---
+
+
+class BackdropClickListener(dynamic_proxy(View.OnClickListener)):
+    """Outside-tap dismiss. Only fires for taps on the backdrop itself —
+    child buttons (reactions / menu rows) consume their own taps first."""
+
+    def __init__(self, session_ref: weakref.ReferenceType):
+        super().__init__()
+        self.session_ref = session_ref
+
+    def onClick(self, v):
+        s = self.session_ref()
+        if s is not None and not s.is_dismissing:
+            s.dismiss(animated=True)
+
+
+class OverlayKeyListener(dynamic_proxy(View.OnKeyListener)):
+    def __init__(self, session_ref: weakref.ReferenceType):
+        super().__init__()
+        self.session_ref = session_ref
+
+    def onKey(self, v, key_code, event):
+        if key_code == KeyEvent.KEYCODE_BACK:
+            if event is not None and event.getAction() == KeyEvent.ACTION_UP:
+                s = self.session_ref()
+                if s is not None and not s.is_dismissing:
+                    s.dismiss(animated=True)
+            return True
+        return False
+
+
+class ReactionClickListener(dynamic_proxy(View.OnClickListener)):
+    def __init__(self, session_ref, emoji):
+        super().__init__()
+        self.session_ref, self.emoji = session_ref, emoji
+
+    def onClick(self, view):
+        session = self.session_ref()
+        if session is not None and session.is_active():
+            do_haptic(view, "tap", session._hl())
+            session._dispatch_reaction(self.emoji)
+
+
+class ReactionItemTouchListener(dynamic_proxy(View.OnTouchListener)):
+    """One charge engine; the slide setting applies to reaction pills too."""
+    def __init__(self, session_ref, idx):
+        super().__init__()
+        self.session_ref, self.idx = session_ref, idx
+        self._down = None
+        self._moved = False
+        self._card_drag = {}
+
+    def onTouch(self, v, event):
+        session = self.session_ref()
+        if session is None or not session.is_active() or event is None:
+            return False
+        action = event.getActionMasked()
+        if action == MotionEvent.ACTION_DOWN:
+            self._down = (event.getRawX(), event.getRawY())
+            self._moved = False
+            self._card_drag = {}
+            parent = v.getParent()
+            if parent is not None:
+                parent.requestDisallowInterceptTouchEvent(True)
+            session._change_hover("rx", self.idx, v)
+            return True
+        if action in (MotionEvent.ACTION_MOVE, MotionEvent.ACTION_UP):
+            if self._down is None:
+                return True
+            dx, dy = event.getRawX() - self._down[0], event.getRawY() - self._down[1]
+            self._moved = self._moved or dx * dx + dy * dy > AndroidUtilities.dp(8) ** 2
+            plugin = session.plugin_ref()
+            slide = plugin is None or plugin.get_setting("slide_select", True)
+            scrolling = slide and session._track_card_scroll(self._card_drag, event)
+            if scrolling:
+                session.clear_hover()
+            elif slide and (self._moved or action == MotionEvent.ACTION_UP):
+                session.update_hover(event.getRawX(), event.getRawY(), v, during_entrance=True)
+            elif not slide:
+                inside = 0 <= event.getX() <= v.getWidth() and 0 <= event.getY() <= v.getHeight()
+                session._change_hover("rx" if inside else None, self.idx if inside else -1, v)
+            if action == MotionEvent.ACTION_UP:
+                if scrolling or (not slide and session._hover_kind is None):
+                    # Leaving a pill with slide selection off cancels the tap.
+                    session.clear_hover()
+                else:
+                    session.commit_hover_or_dismiss(v)
+                self._down = None
+            return True
+        if action == MotionEvent.ACTION_CANCEL:
+            self._down = None
+            session.clear_hover()
+            return True
+        return False
+
+
+class MenuActionClickListener(dynamic_proxy(View.OnClickListener)):
+    def __init__(self, session_ref: weakref.ReferenceType, opt_id: int):
+        super().__init__()
+        self.session_ref = session_ref
+        self.opt_id = opt_id
+
+    def onClick(self, v):
+        s = self.session_ref()
+        if s is not None and not s.is_dismissing:
+            if s._hover_kind is None:
+                do_haptic(v, "tap", s._hl())
+            s._dispatch_action(self.opt_id)
+
+
+class ActionRowTouchListener(dynamic_proxy(View.OnTouchListener)):
+    """Owns the gesture when it starts on a menu row, including cross-row
+    press-drag-release. A parent listener cannot reliably see a child's DOWN
+    event on Android, so the actionable child must receive the stream."""
+    def __init__(self, session_ref: weakref.ReferenceType):
+        super().__init__()
+        self.session_ref = session_ref
+        self._down = None
+        self._moved = False
+        self._card_drag = {}
+
+    def onTouch(self, v, event):
+        s = self.session_ref()
+        if s is None or s.is_dismissing or event is None:
+            return False
+        try:
+            action = event.getActionMasked()
+        except Exception:
+            return False
+        if action == MotionEvent.ACTION_DOWN:
+            self._down = (event.getRawX(), event.getRawY())
+            self._moved = False
+            self._card_drag = {}
+            v.getParent().requestDisallowInterceptTouchEvent(True)
+            s.update_hover(event.getRawX(), event.getRawY(), v, during_entrance=True)
+            s._track_card_scroll(self._card_drag, event)
+            return True
+        if action in (MotionEvent.ACTION_MOVE, MotionEvent.ACTION_UP):
+            if self._down is not None:
+                dx, dy = event.getRawX() - self._down[0], event.getRawY() - self._down[1]
+                slop = AndroidUtilities.dp(8)
+                self._moved = self._moved or dx * dx + dy * dy > slop * slop
+            scrolling = s._track_card_scroll(self._card_drag, event)
+            plugin = s.plugin_ref()
+            slide = plugin is None or plugin.get_setting("slide_select", True)
+            if scrolling:
+                s.clear_hover()
+            elif slide:
+                s.update_hover(event.getRawX(), event.getRawY(), v, during_entrance=True)
+            if action == MotionEvent.ACTION_UP:
+                if scrolling:
+                    s.clear_hover()
+                elif self._down is not None and not self._moved:
+                    # A direct tap is reliable even during the entrance scale.
+                    v.performClick()
+                elif slide:
+                    s.commit_hover_or_dismiss(v)
+                else:
+                    s.clear_hover()
+                self._down = None
+            return True
+        if action == MotionEvent.ACTION_CANCEL:
+            self._down = None
+            s.clear_hover()
+            return True
+        return True
+
+
+class DragSelectTouchListener(dynamic_proxy(View.OnTouchListener)):
+    """iOS-style press-drag-release across menu rows AND reaction pills.
+
+    Attached to the menu card, the reaction bar, AND (via forwarder) the
+    chat list that owns the still-held long-press gesture. Tracks the
+    finger with raw screen coords, highlights whatever is under it with a
+    crisp tick, and commits on release. Always returns True on DOWN so the
+    rest of the gesture keeps flowing here; returns False when idle.
+    """
+
+    def __init__(self, session_ref: weakref.ReferenceType):
+        super().__init__()
+        self.session_ref = session_ref
+        self._card_drag = {}
+
+    def onTouch(self, v, event):
+        s = self.session_ref()
+        if s is None or s.is_dismissing:
+            return False
+        if event is None:
+            return False
+        try:
+            action = event.getActionMasked()
+            plugin = s.plugin_ref()
+            if plugin is not None and not plugin.get_setting("slide_select", True):
+                s.clear_hover()
+                return False
+            if action == MotionEvent.ACTION_DOWN:
+                self._card_drag = {}
+            if action in (MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE, MotionEvent.ACTION_UP):
+                scrolling = s._track_card_scroll(self._card_drag, event)
+                if scrolling:
+                    s.clear_hover()
+                else:
+                    s.update_hover(event.getRawX(), event.getRawY(), v, during_entrance=True)
+                if action == MotionEvent.ACTION_UP and not scrolling:
+                    s.commit_hover_or_dismiss(v)
+                return True
+            if action == MotionEvent.ACTION_CANCEL:
+                s.clear_hover()
+                return True
+            return False
+        except Exception as error:
+            diag(f"bar drag selection failed: {error}")
+            s.dismiss(animated=False)
+            return True
+
+
+# Cached proxy class for RecyclerView.OnItemTouchListener. Building it inside
+# ListDragForwarder.attach() regenerated a Java proxy class on every long-press,
+# and generated classes are not garbage collected for the process lifetime.
+_ITEM_TOUCH_PROXY_CLASS: Optional[Any] = None
+_LAYOUT_PROXY_CLASS: Optional[Any] = None
+
+
+class DecorGestureHook(MethodHook):
+    """See the initiating stream above RecyclerView's interception veto."""
+    def __init__(self, session_ref):
+        super().__init__()
+        self.session_ref = session_ref
+
+    def before_hooked_method(self, param):
+        session = self.session_ref()
+        if (session is None or not session.is_attached()
+                or session._dispatch_canceling
+                or param.thisObject != session.parent_container_owner()):
+            return
+        args = _java_array_to_list(param.args)
+        if len(args) != 1 or args[0] is None:
+            return
+        event = args[0]
+        try:
+            action = event.getActionMasked()
+            if action == MotionEvent.ACTION_DOWN and not session.is_dismissing:
+                session._original_stream = False
+                return  # Real overlay children own subsequent taps.
+            if not session._original_stream and not session.is_dismissing:
+                return
+            # Consume before any commit; if suppression fails, do no action.
+            param.setResult(True)
+            if session.is_dismissing:
+                return
+            session._forward_original_touch(event)
+        except Exception as error:
+            diag(f"decor gesture interception failed; restoring native chat: {error}")
+            session.dismiss(animated=False)
+
+
+def _build_item_touch_proxy_class(iface: Any) -> Optional[Any]:
+    """Build the OnItemTouchListener proxy class once, at module scope, so the
+    generated Java class is reused until this plugin module is reloaded.
+
+    Each listener instance owns its session weakref and mirrors only the
+    original long-press stream. Releasing off-target keeps the menu open.
+    """
+    try:
+
+        class _Base(dynamic_proxy(iface)):
+            def __init__(self, session_ref):
+                super().__init__()
+                self.session_ref = session_ref
+                self.finished = False
+                self.saw_stream = False
+
+            def onInterceptTouchEvent(self, rv, event):
+                sref = self.session_ref
+                s = sref() if sref is not None else None
+                if self.finished or s is None or s.is_dismissing:
+                    return False
+                if event is None:
+                    return False
+                try:
+                    action = event.getActionMasked()
+                except Exception:
+                    return False
+                if action == MotionEvent.ACTION_MOVE:
+                    self.saw_stream = True
+                    try:
+                        s.update_hover(event.getRawX(), event.getRawY(), rv)
+                    except Exception:
+                        pass
+                    return False
+                if action == MotionEvent.ACTION_UP:
+                    self.saw_stream = True
+                    self.finished = True
+                    try:
+                        if s.update_hover(event.getRawX(), event.getRawY(), rv):
+                            s.commit_hover_or_dismiss(rv)
+                        else:
+                            # Lift the initiating finger and then tap an action.
+                            s.clear_hover()
+                    except Exception as e:
+                        diag(f"forwarder UP failed: {e}")
+                    return False
+                if action == MotionEvent.ACTION_CANCEL:
+                    self.finished = True
+                    try:
+                        s.clear_hover()
+                    except Exception as e:
+                        diag(f"forwarder CANCEL failed: {e}")
+                    return False
+                return False
+
+            def onTouchEvent(self, rv, event):
+                return
+
+            def onRequestDisallowInterceptTouchEvent(self, disallow):
+                if disallow:
+                    diag_once("forwarder-disallow", "original gesture disallowed interception; slide forwarding may be unavailable; tap actions remain usable")
+
+        return _Base
+    except Exception as e:
+        diag(f"proxy class build failed: {e}")
+        return None
+
+
+class ListDragForwarder:
+    """Forwards the STILL-HELD long-press gesture to the overlay.
+
+    The finger went down before the overlay existed, so Android keeps
+    routing MOVE/UP to the chat list. This attaches as a RecyclerView
+    OnItemTouchListener (additive — it never replaces Telegram's own
+    listeners) and mirrors the stream into the session via raw coords,
+    always returning False so list behavior is unchanged.
+    """
+
+    def __init__(self, session_ref: weakref.ReferenceType):
+        self.session_ref = session_ref
+        self._proxy = None
+        self._list_view = None
+
+    def attach(self, list_view: Any) -> bool:
+        try:
+            iface = jclass("androidx.recyclerview.widget.RecyclerView$OnItemTouchListener")
+            if iface is None:
+                return False
+            session_ref = self.session_ref
+
+            # The proxy CLASS is built once and reused across peeks.
+            global _ITEM_TOUCH_PROXY_CLASS
+            if _ITEM_TOUCH_PROXY_CLASS is None:
+                _ITEM_TOUCH_PROXY_CLASS = _build_item_touch_proxy_class(iface)
+            proxy_cls = _ITEM_TOUCH_PROXY_CLASS
+            if proxy_cls is None:
+                return False
+            self._proxy = proxy_cls(session_ref)
+            list_view.addOnItemTouchListener(self._proxy)
+            self._list_view = list_view
+            proxy_ref = weakref.ref(self._proxy)
+            def check_stream():
+                proxy = proxy_ref()
+                session = session_ref()
+                if proxy is not None and session is not None and session.is_active() and not proxy.saw_stream:
+                    diag("forwarder: no MOVE/UP observed yet; stationary hold or intercepted stream; tap actions remain available")
+            run_on_ui_thread(check_stream, 750)
+            return True
+        except Exception as e:
+            try:
+                log(f"[peek] forwarder attach failed: {e}")
+            except Exception:
+                pass
+            return False
+
+    def detach(self) -> None:
+        try:
+            if self._list_view is not None and self._proxy is not None:
+                self._list_view.removeOnItemTouchListener(self._proxy)
+        except Exception:
+            pass
+        self._proxy = None
+        self._list_view = None
+
+
+# --- Safe Telegram Reflection Helpers ---
+
+
+def _java_array_to_list(value: Any) -> list:
+    """Return Java arrays/collections as Python list without iterating a
+    Chaquopy array (which historically raises TypeError)."""
+    if value is None:
+        return []
+    try:
+        return [value[i] for i in range(len(value))]
+    except Exception:
+        pass
+    try:
+        if hasattr(value, "size") and hasattr(value, "get"):
+            return [value.get(i) for i in range(int(value.size()))]
+    except Exception:
+        pass
+    return []
+
+
+def _clear_native_selection_arrays(chat_activity: Any) -> bool:
+    """Abort dispatch if required selection state cannot safely be reset."""
+    for field_name in ("selectedMessagesIds", "selectedMessagesCanCopyIds", "selectedMessagesCanStarIds"):
+        arrays = _read_field(chat_activity, field_name)
+        if arrays is None:
+            diag_once("selection:" + field_name, f"selection state unavailable: {field_name}")
+            if field_name == "selectedMessagesIds":
+                return False
+            continue
+        for array in _java_array_to_list(arrays):
+            try:
+                array.clear()
+            except Exception as error:
+                diag(f"clearing {field_name} failed; refusing dispatch: {error}")
+                return False
+    return True
+
+
+def _write_native_field(receiver, field, value):
+    try:
+        result = set_private_field(receiver, field, value)
+        if result is not False:
+            return True
+        diag(f"native field {field}: SDK setter rejected write; trying public access")
+    except Exception as error:
+        diag(f"native field {field}: SDK setter failed; trying public access: {error}")
+    try:
+        setattr(receiver, field, value)
+        return True
+    except Exception as error:
+        diag(f"native field {field}: unavailable: {error}")
+        return False
+
+
+def _message_call(message_obj: Any, method_name: str, default: Any = False) -> Any:
+    """Call a MessageObject predicate independently so one missing Telegram
+    API cannot abort media/save detection."""
+    try:
+        method = getattr(message_obj, method_name)
+        if not callable(method):
+            return default
+        return method()
+    except Exception:
+        return default
+
+
+def _valid_message_group(chat_activity: Any, cell: Any, message_obj: Any) -> Any:
+    """Match ChatActivity's native group selection rules where possible."""
+    try:
+        if hasattr(chat_activity, "getValidGroupedMessage"):
+            return chat_activity.getValidGroupedMessage(message_obj)
+    except Exception:
+        pass
+    if cell is not None and _message_call(cell, "getMessageObject", None) == message_obj:
+        try:
+            return cell.getCurrentMessagesGroup()
+        except Exception:
+            pass
+    return None
+
+
+def _find_declared_method(receiver, name, parameter_count, signature=None):
+    """Cache per declaring Class and signature. Never pick an ambiguous overload."""
+    signature = tuple(signature) if signature is not None else None
+    try:
+        current = receiver if hasattr(receiver, "getDeclaredMethods") else receiver.getClass()
+        try:
+            hash(current)
+            class_key = current
+        except Exception:
+            class_key = (type(receiver), id(receiver))  # simulated / unusual wrappers
+        key = (class_key, name, signature if signature is not None else parameter_count)
+        if key in _method_cache:
+            return _method_cache[key]
+    except Exception as error:
+        diag(f"method {name}: receiver class unavailable: {error}")
+        return None
+    while current is not None:
+        matches = []
+        try:
+            for method in _java_array_to_list(current.getDeclaredMethods()):
+                if str(method.getName()) != name:
+                    continue
+                names = tuple(str(p.getName()) for p in _java_array_to_list(method.getParameterTypes()))
+                if len(names) == parameter_count and (signature is None or names == signature):
+                    matches.append(method)
+            if len(matches) > 1:
+                diag(f"method {name}: ambiguous overload; refusing count-only lookup")
+                _method_cache[key] = None
+                return None
+            if matches:
+                method = matches[0]
+                method.setAccessible(True)
+                _method_cache[key] = method
+                return method
+        except Exception as error:
+            diag_once("lookup:" + name, f"method {name}: declared lookup failed: {error}")
+        try:
+            current = current.getSuperclass()
+        except Exception as error:
+            diag(f"method {name}: superclass lookup failed: {error}")
+            break
+    diag_once("missing:" + name + str(signature), f"method {name} {signature or parameter_count}: unavailable; native fallback")
+    _method_cache[key] = None
+    return None
+
+
+# Three-state result for reflective invocation. Collapsing these into a bool
+# is what previously let a Java-side exception be reported to the caller as
+# "the action succeeded".
+INVOKE_NOT_RUN = 0     # never reached Java; a fallback MAY be tried
+INVOKE_OK = 1          # ran and returned normally
+INVOKE_THREW = 2       # ran, then Java threw; MUST NOT be retried
+
+
+def _invoke_java_method(method: Any, receiver: Any, args: list) -> int:
+    """Invoke a reflected Java method under Chaquopy.
+
+    Returns INVOKE_OK / INVOKE_THREW / INVOKE_NOT_RUN.
+
+    The distinction matters: a java.lang.reflect.InvocationTargetException
+    means the Java method DID run and threw internally. Treating that as
+    failure would let the caller's fallback execute the same action a second
+    time (two delete dialogs, two fragments). Treating it as success is also
+    wrong, because the action then did not actually happen. So it is reported
+    as its own state: the caller must not retry, but must not claim success.
+    """
+    if method is None:
+        return INVOKE_NOT_RUN
+    try:
+        method.setAccessible(True)
+    except Exception:
+        pass
+
+    # valueOf() returns a Python number in Chaquopy (automatic unboxing).
+    # Putting that number into Object[] then boxes int as Long and float as
+    # Double. Reflection cannot narrow either to int/float. Preserve the
+    # declared primitive types all the way into Object[].
+    try:
+        primitive_types = {"boolean": jboolean, "byte": jbyte, "short": jshort,
+                           "int": jint, "long": jlong, "float": jfloat,
+                           "double": jdouble, "char": jchar}
+        parameters = _java_array_to_list(method.getParameterTypes())
+        if len(parameters) != len(args):
+            diag(f"java-invoke: {method.getName()} argument count mismatch")
+            return INVOKE_NOT_RUN
+        typed = []
+        for parameter, value in zip(parameters, args):
+            kind = str(parameter.getName())
+            converter = primitive_types.get(kind)
+            if converter is not None:
+                if kind == "boolean":
+                    value = _as_bool(value)
+                elif kind in ("float", "double"):
+                    value = float(value)
+                elif kind != "char":
+                    value = int(value)
+                value = converter(value)
+            typed.append(value)
+        method.invoke(receiver, jarray(jclass("java.lang.Object"))(typed))
+        return INVOKE_OK
+    except Exception as error:
+        if _is_invocation_target_exception(error):
+            diag(f"java-invoke: target method threw internally: {error}")
+            return INVOKE_THREW
+        diag(f"java-invoke: typed invocation failed: {error}")
+        return INVOKE_NOT_RUN
+
+
+def _is_invocation_target_exception(error: BaseException) -> bool:
+    """True when a reflected call reached Java and the Java code threw,
+    as opposed to a Chaquopy marshalling/arity failure before dispatch."""
+    seen = 0
+    current: Any = error
+    while current is not None and seen < 8:
+        seen += 1
+        try:
+            if "InvocationTargetException" in str(type(current)) or "InvocationTargetException" in str(current):
+                return True
+            cause = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+        except Exception:
+            return False
+        if cause is current:
+            return False
+        current = cause
+    return False
+
+
+def safe_invoke_process_selected_option(chat_activity: Any, cell: Any,
+                                        message_obj: Any, opt_id: int,
+                                        edit_caption: Any = None) -> int:
+    """Three-state dispatch: never retry an action which reached Java."""
+    if chat_activity is None or message_obj is None:
+        return INVOKE_NOT_RUN
+    if Looper.myLooper() != Looper.getMainLooper():
+        diag("processSelectedOption: refusing off-thread selection changes")
+        return INVOKE_NOT_RUN
+    method = _find_declared_method(chat_activity, "processSelectedOption", 1, ["int"])
+    if method is None:
+        return INVOKE_NOT_RUN
+    params = _java_array_to_list(method.getParameterTypes())
+    if len(params) != 1 or str(params[0].getName()) != "int":
+        diag("processSelectedOption: unexpected parameter types; selection untouched")
+        return INVOKE_NOT_RUN
+    if not _clear_native_selection_arrays(chat_activity):
+        return INVOKE_NOT_RUN
+    for field, value in (("selectedObject", message_obj),
+                         ("selectedObjectGroup", _valid_message_group(chat_activity, cell, message_obj)),
+                         ("selectedObjectToEditCaption", edit_caption)):
+        if not _write_native_field(chat_activity, field, value):
+            return INVOKE_NOT_RUN
+    return _invoke_java_method(method, chat_activity, [int(opt_id)])
+
+
+def _read_field(obj: Any, name: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    try:
+        value = getattr(obj, name)
+    except Exception:
+        try:
+            value = get_private_field(obj, name)
+        except Exception:
+            return default
+    # The SDK returns None for a field it cannot find, rather than raising.
+    # In particular, newer ChatActivity builds replaced reportType with
+    # isReport(); int(None) used to abort every createMenu callback.
+    return default if value is None else value
+
+
+def _as_bool(value: Any) -> bool:
+    # Xposed args are Object[]. A boxed java.lang.Boolean may have Python
+    # object truthiness even when booleanValue() is false.
+    if isinstance(value, bool):
+        return value
+    try:
+        return bool(value.booleanValue())
+    except Exception:
+        return bool(value)
+
+
+def _notify(chat: Any, message: str) -> None:
+    diag(message)
+    try:
+        activity = chat.getParentActivity()
+        if activity is not None:
+            Toast.makeText(activity, ui_text(message), Toast.LENGTH_SHORT).show()
+    except Exception:
+        pass
+
+
+def _native_items(chat: Any, cell: Any, message: Any):
+    """Ask Telegram for labels, icons, permissions and album caption state.
+
+    Restore temporary fields even if fillMessageMenu throws. Unsupported
+    builds use the original native menu instead of an invented action list.
+    """
+    fields = ("selectedObject", "selectedObjectGroup", "selectedObjectToEditCaption")
+    previous = [_read_field(chat, field) for field in fields]
+    try:
+        ArrayList = jclass("java.util.ArrayList")
+        icons, titles, options = ArrayList(), ArrayList(), ArrayList()
+        for field, value in zip(fields, (message, _valid_message_group(chat, cell, message), None)):
+            if not _write_native_field(chat, field, value):
+                raise RuntimeError(f"native menu field {field} unavailable")
+        primary = (_message_call(cell, "getPrimaryMessageObject", message)
+                   if _message_call(cell, "getMessageObject", None) == message else message) or message
+        try:
+            direct = getattr(chat, "fillMessageMenu")
+        except AttributeError:
+            direct = None
+        if direct is not None:
+            # Once entered, any target exception must not execute it again.
+            direct(primary, icons, titles, options)
+        else:
+            diag_once("fill-private", "fillMessageMenu: trying reflective access")
+            signature = ["org.telegram.messenger.MessageObject"] + ["java.util.ArrayList"] * 3
+            method = _find_declared_method(chat, "fillMessageMenu", 4, signature)
+            result = _invoke_java_method(method, chat, [primary, icons, titles, options])
+            if result != INVOKE_OK:
+                raise RuntimeError(f"fillMessageMenu unavailable (invoke state {result})")
+        caption = _read_field(chat, fields[2])
+        result = [(str(titles.get(i)), int(icons.get(i)), int(options.get(i)),
+                   int(options.get(i)) == OPTION_DELETE)
+                  for i in range(int(options.size()))]
+        # Native createMenu applies this filter after fillMessageMenu.
+        if _message_call(message, "isHiddenSensitive", False) and not _read_field(message, "isMediaSpoilersRevealed", False):
+            blocked = {OPTION_SAVE_TO_GALLERY, OPTION_SAVE_TO_GALLERY2,
+                       OPTION_SAVE_TO_DOWNLOADS_OR_MUSIC, OPTION_FORWARD, OPTION_REPLY}
+            result = [item for item in result if item[2] not in blocked]
+        return result, caption
+    finally:
+        for field, value in zip(fields, previous):
+            _write_native_field(chat, field, value)
+
+
+def _allowed_emojis(chat: Any, message: Any) -> list:
+    """Offer enabled standard emoji within the chat's reaction restrictions."""
+    if (_message_call(chat, "isSecretChat", False)
+            or _message_call(chat, "isInScheduleMode", False)
+            or _message_call(chat, "isQuickRepliesOrWelcomeMessagesMode", False)
+            or _message_call(message, "isEphemeral", False)
+            or _message_call(message, "isSecretMedia", False)
+            or not _message_call(message, "isReactionsAvailable", False)):
+        return []
+    try:
+        enabled = chat.getMediaDataController().getEnabledReactionsList()
+        emojis = [str(_read_field(item, "reaction", "")) for item in _java_array_to_list(enabled)
+                  if not _read_field(item, "inactive", False)]
+        info = _message_call(chat, "getCurrentChatInfo", _read_field(chat, "chatInfo"))
+        if _message_call(message, "isForwardedChannelPost", False):
+            info = chat.getMessagesController().getChatFull(-int(message.getFromChatId()))
+        policy = _read_field(info, "available_reactions")
+        kind = str(policy.getClass().getSimpleName()) if policy is not None else ""
+        if kind == "TL_chatReactionsNone":
+            return []
+        if kind == "TL_chatReactionsSome":
+            allowed = {_reaction_key(r)
+                       for r in _java_array_to_list(_read_field(policy, "reactions"))}
+            emojis = [e for e in emojis if e in allowed]
+            emojis.extend(sorted(e for e in allowed if e.startswith("animated_") and e not in emojis))
+        elif kind == "TL_chatReactionsAll":
+            # Native history contains custom emoji ids as TL reaction objects.
+            controller = _message_call(chat, "getMediaDataController", None)
+            for getter in ("getRecentReactions", "getTopReactions"):
+                for reaction in _java_array_to_list(_message_call(controller, getter, [])):
+                    key = _reaction_key(reaction)
+                    if key.startswith("animated_") and key not in emojis:
+                        emojis.append(key)
+        current_chat = _message_call(chat, "getCurrentChat", None)
+        if current_chat is not None:
+            try:
+                ChatObject = jclass("org.telegram.messenger.ChatObject")
+                if not ChatObject.isChannelAndNotMegaGroup(current_chat):
+                    if not ChatObject.canUserDoAction(current_chat, ChatObject.ACTION_SEND_REACTIONS):
+                        return []
+            except Exception as error:
+                diag_once("reaction-permission", f"optional reaction permission check unavailable; using message/chat policy: {error}")
+        # Native unique reaction limit: at capacity only existing reaction types
+        # may be added. Paid reactions do not count towards this limit.
+        try:
+            controller = chat.getMessagesController()
+            limit = int(controller.getChatMaxUniqReactions(message.getDialogId()))
+            results = _java_array_to_list(_read_field(_read_field(_read_field(message, "messageOwner"), "reactions"), "results", []))
+            counted = [r for r in results if "reactionPaid" not in str(_read_field(r, "reaction").getClass().getSimpleName())]
+            if limit > 0 and len(counted) >= limit:
+                existing = {_reaction_key(_read_field(r, "reaction")) for r in counted}
+                emojis = [e for e in emojis if e in existing]
+        except Exception as error:
+            diag_once("reaction-limit", f"optional unique reaction limit unavailable; native dispatcher will enforce it: {error}")
+        return [e for e in emojis if e]
+    except Exception as error:
+        diag(f"reaction eligibility unavailable: {error}")
+        return []
+
+
+def _open_native_menu(plugin: Any, chat: Any, args: list, native_method=None, select=False) -> bool:
+    args = list(args)
+    if len(args) < 2:
+        _notify(chat, "Native menu arguments are unavailable. Long-press again.")
+        return False
+    # single=False may only select a message for some Telegram message types.
+    # More actions explicitly requests the actual action popup.
+    args[1] = not select
+    plugin._native_bypass = getattr(plugin, "_native_bypass", 0) + 1
+    try:
+        method = native_method
+        if method is None:
+            signature = ["android.view.View", "boolean", "boolean", "float", "float"] + ["boolean"] * (len(args) - 5)
+            diag_once("createMenu-relookup", "createMenu hook method unavailable; trying exact legacy signature")
+            method = _find_declared_method(chat, "createMenu", len(args), signature)
+        result = _invoke_java_method(method, chat, args)
+        if result != INVOKE_OK:
+            _notify(chat, "Could not open native menu. Long-press the message again.")
+        return result == INVOKE_OK
+    finally:
+        plugin._native_bypass -= 1
+
+
+class PeekMenuSession:
+    """
+    Manages the lifecycle, layout calculations, rendering, and dismissal
+    of a single iOS Peek & Pop overlay instance.
+    """
+
+    def __init__(self, plugin: "IOSPeekMenuPlugin", chat_activity: Any, cell: Any):
+        self.plugin_ref = weakref.ref(plugin)
+        self.chat_activity_owner = lambda: chat_activity
+        self.cell_owner = lambda: cell
+        self.parent_container_owner: Optional[Any] = None
+
+        self.overlay_root: Optional[FrameLayout] = None
+        self.backdrop_view: Optional[View] = None
+        self.preview_image: Optional[ImageView] = None
+        self.reaction_bar: Optional[LinearLayout] = None
+        self.reaction_background: Optional[View] = None
+        self.context_menu: Optional[Any] = None
+
+        self.preview_bitmap: Optional[Bitmap] = None
+        self.is_dismissing = False
+        self._is_active = True
+        self._cleanup_done = False
+        # Guard against re-entering _cleanup while it is mid-flight, without
+        # marking the session detached before removeView() has happened.
+        self._cleanup_in_progress = False
+
+
+        # Background blur belongs to our snapshot ImageView.
+        self._blur_target: Optional[Any] = None
+        # Card rows retain their touch-target size on short screens.
+        # Final preview position after layout; the preview may be shifted up
+        # so a tall action card never covers the message.
+        self._resolved_cell_y: int = 0
+        self._resolved_cell_x: int = 0
+        # Real size of the built reaction pill, filled in by _build_reaction_bar.
+        self._computed_rx_w: int = AndroidUtilities.dp(310)
+        self._computed_rx_h: int = AndroidUtilities.dp(48)
+        # Slide-to-select state (iOS hold-and-drag across actions)
+        self._row_backgrounds = []
+        self.menu_rows: list = []          # list of (row_view, opt_id)
+        self.reaction_views: list = []    # list of (container_view, emoji_char)
+        self.reaction_halos: list = []    # list of (halo_view, halo_bg, tv)
+        self._hover_kind: Optional[str] = None  # None | "menu" | "rx"
+        self._hover_idx: int = -1
+        self._hover_rx_token: int = 0
+        self._rx_highlighted: int = -1
+        self._hover_is_super: bool = False
+        self._hover_started = 0.0
+        self._menu_is_dark: bool = True
+        self._computed_menu_w: int = AndroidUtilities.dp(240)
+        self._computed_menu_h: int = AndroidUtilities.dp(225)
+        self._list_forwarder: Optional[Any] = None
+        self.message_obj = _message_call(cell, "getMessageObject", None)
+        self.primary_message = _message_call(cell, "getPrimaryMessageObject", self.message_obj) or self.message_obj
+        self.native_method = None
+        self.native_args = []
+        self.native_items = []
+        self.edit_caption = None
+        self.menu_scroll = None
+        self._blur_bitmap = None
+        self._interaction_ready_ms = 0.0
+        self._show_failed = False
+        self._listeners = []
+        self._touch_hook = self._touch_unhook = None
+        self._dispatch_method = None
+        self._dispatch_canceling = False
+        self._original_cancelled = False
+        self._original_aborted = False
+        self._chat_list = None
+        self._original_stream = True
+        self._original_moved = False
+        self._original_start = None
+        self._original_card_drag = {}
+        self._menu_scrollable = False
+        self._custom_glyphs = []
+        self._a11y_hidden = []
+        self._hit_rects = None
+        self._layout_listener = None
+        self._property_animators = []
+        self._motion_callbacks = []
+        self._motion_generation = 0
+        self._entrance_running = False
+        self._actions_origin = (0.0, 0.0)
+        self._snapshot_origin_x = 0
+        self._snapshot_origin_y = 0
+        # True only when the preview is Telegram's reported bubble rectangle;
+        # the full-cell fallback keeps the older edge alignment.
+        self._bubble_cropped = False
+        self._card_bg = None
+        self._pill_bg = None
+
+    def is_active(self) -> bool:
+        return self._is_active and not self.is_dismissing
+
+    def is_attached(self) -> bool:
+        return (not self._cleanup_done and self.overlay_root is not None
+                and self.overlay_root.getParent() is not None)
+
+    def _keep_listener(self, listener):
+        self._listeners.append(listener)
+        return listener
+
+    def _message_still_here(self) -> bool:
+        cell = self.cell_owner() if self.cell_owner else None
+        if (cell is not None and cell.getParent() is not None
+                and _message_call(cell, "getMessageObject", None) == self.message_obj):
+            try:
+                if cell.isAttachedToWindow():
+                    return True
+            except Exception as error:
+                diag_once("cell-attached", f"attachment query unavailable; using parent binding: {error}")
+                return True
+        chat = self.chat_activity_owner() if self.chat_activity_owner else None
+        diag("message detached or rebound; refusing stale action")
+        self.dismiss(animated=False)
+        _notify(chat, "The message moved. Long-press it again to open its menu.")
+        return False
+
+    def show(self) -> None:
+        chat_activity = self.chat_activity_owner()
+        cell = self.cell_owner()
+        if chat_activity is None or cell is None:
+            diag("show: session owners unavailable")
+            self._cleanup()
+            return
+
+        activity = chat_activity.getParentActivity()
+        if activity is None:
+            try:
+                activity = AndroidUtilities.findActivity(chat_activity.getContext())
+            except Exception as e:
+                diag(f"show: findActivity failed: {e}")
+        if activity is None:
+            diag("show: no parent activity")
+            self._cleanup()
+            return
+
+        window = activity.getWindow()
+        if window is None:
+            diag("show: activity has no window")
+            self._cleanup()
+            return
+
+        decor_view = window.getDecorView()
+        if decor_view is None:
+            diag("show: no decor view")
+            self._cleanup()
+            return
+        # isinstance() against a Chaquopy JavaClass raises AttributeError
+        # ('isInstance') -- use the Chaquopy-safe check instead.
+        if not _is_java_instance(decor_view, ViewGroup):
+            diag(
+                f"show: decorView {type(decor_view).__name__} failed ViewGroup check "
+                f"(ViewGroup class = {getattr(ViewGroup, '__name__', '?')})"
+            )
+            self._cleanup()
+            return
+
+        self.parent_container_owner = lambda: decor_view
+        self._chat_list = _message_call(chat_activity, "getChatListView", _read_field(chat_activity, "chatListView"))
+        if self._chat_list is not None:
+            method = _find_declared_method(self._chat_list, "stopScroll", 0, [])
+            if _invoke_java_method(method, self._chat_list, []) != INVOKE_OK:
+                diag_once("stop-scroll", "chat stopScroll unavailable; leaving its scroll position untouched")
+        context = activity
+
+        # Measure target cell dimensions and window coordinates
+        cell_w = cell.getWidth()
+        cell_h = cell.getHeight()
+        if cell_w <= 0 or cell_h <= 0:
+            diag(f"show: cell has zero size ({cell_w}x{cell_h})")
+            self._cleanup()
+            return
+
+        self._source_cell_size = (int(cell_w), int(cell_h))
+
+        loc = jarray(jint)([0, 0])
+        cell.getLocationInWindow(loc)
+        cell_x = int(loc[0])
+        cell_y = int(loc[1])
+        if len(self.native_args) >= 5:
+            try:
+                raw_origin = jarray(jint)([0, 0])
+                cell.getLocationOnScreen(raw_origin)
+                self._original_start = (int(raw_origin[0]) + float(self.native_args[3]),
+                                        int(raw_origin[1]) + float(self.native_args[4]))
+            except Exception as error:
+                diag_once("original-origin", f"held pointer origin unavailable; using target hits: {error}")
+
+        origin = jarray(jint)([0, 0])
+        decor_view.getLocationInWindow(origin)
+        cell_x, cell_y = cell_x - int(origin[0]), cell_y - int(origin[1])
+        self._window_w = max(1, int(decor_view.getWidth()))
+        self._window_h = max(1, int(decor_view.getHeight()))
+        visible, screen_origin = Rect(), jarray(jint)([0, 0])
+        decor_view.getWindowVisibleDisplayFrame(visible)
+        decor_view.getLocationOnScreen(screen_origin)
+        self._usable_bounds = (max(0, int(visible.left - screen_origin[0])),
+                               max(0, int(visible.top - screen_origin[1])),
+                               min(self._window_w, int(visible.right - screen_origin[0])),
+                               min(self._window_h, int(visible.bottom - screen_origin[1])))
+        if self._usable_bounds[2] <= self._usable_bounds[0] or self._usable_bounds[3] <= self._usable_bounds[1]:
+            self._usable_bounds = (0, int(AndroidUtilities.statusBarHeight), self._window_w, self._window_h)
+        if self._usable_bounds[3] - self._usable_bounds[1] < AndroidUtilities.dp(140):
+            self._cleanup()
+            return
+        cell_origin_x, cell_origin_y = cell_x, cell_y
+        clip_left = max(0, self._usable_bounds[0] - cell_origin_x)
+        clip_right = min(cell_w, self._usable_bounds[2] - cell_origin_x)
+        clip_top = max(0, self._usable_bounds[1] - cell_origin_y)
+        clip_bottom = min(cell_h, self._usable_bounds[3] - cell_origin_y)
+        if clip_right <= clip_left or clip_bottom <= clip_top:
+            self._cleanup()
+            return
+
+        # Telegram-iOS extracts the bubble background frame, not the full chat
+        # row. Telegram Android exposes the equivalent bounds on ChatMessageCell
+        # in supported builds. If a fork removes them (or this is a sticker with
+        # no bubble), retain the complete visible cell as a safe visual fallback.
+        bubble_bounds = self._bubble_bounds(cell, int(self._source_cell_size[0]),
+                                            int(self._source_cell_size[1]))
+        self._bubble_cropped = bubble_bounds is not None
+        if bubble_bounds is None:
+            bubble_bounds = (0, 0, int(self._source_cell_size[0]), int(self._source_cell_size[1]))
+            diag_once("bubble-bounds-fallback", "bubble bounds unavailable; using the visible message cell")
+        bubble_left, bubble_top, bubble_right, bubble_bottom = bubble_bounds
+        source_left = max(clip_left, bubble_left)
+        source_top = max(clip_top, bubble_top)
+        source_right = min(clip_right, bubble_right)
+        source_bottom = min(clip_bottom, bubble_bottom)
+        if source_right <= source_left or source_bottom <= source_top:
+            # Defensive compatibility for forks with unusual drawable bounds.
+            source_left, source_top = clip_left, clip_top
+            source_right, source_bottom = clip_right, clip_bottom
+            self._bubble_cropped = False
+        cell_x = cell_origin_x + source_left
+        cell_y = cell_origin_y + source_top
+        cell_w = int(source_right - source_left)
+        cell_h = int(source_bottom - source_top)
+        self._source_rect = (cell_x, cell_y, cell_w, cell_h)
+        self._snapshot_origin_x = int(source_left)
+        self._snapshot_origin_y = int(source_top)
+
+        # 2. Build Root Overlay Container
+        self.overlay_root = FrameLayout(context)
+        try:
+            self.overlay_root.setTag("ios_peek_menu_overlay")
+        except Exception:
+            pass
+        self.overlay_root.setLayoutParams(
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            )
+        )
+        self.overlay_root.setClickable(True)
+        self.overlay_root.setFocusable(True)
+        self.overlay_root.setFocusableInTouchMode(True)
+
+        session_weak = weakref.ref(self)
+        # NOTE: root must NOT consume touches via OnTouchListener returning
+        # True — that eats ACTION_DOWN before children (reactions / menu)
+        # ever see it and freezes the whole overlay. Root is clickable so
+        # touches can't fall through to the chat list; only the backdrop
+        # dismisses, children handle their own taps.
+        try:
+            self.overlay_root.setOnTouchListener(None)
+        except Exception:
+            pass
+        self.overlay_root.setOnKeyListener(self._keep_listener(OverlayKeyListener(session_weak)))
+
+        # Theme & message properties
+        is_dark = bool(Theme.isCurrentThemeDark()) if Theme is not None else True
+        message_obj = self.message_obj
+
+        # 3. Backdrop Dimmer Layer (Deep frosted glass scrim)
+        self.backdrop_view = View(context)
+        self.backdrop_view.setLayoutParams(
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            )
+        )
+        if is_dark:
+            self.backdrop_view.setBackgroundColor(Color.parseColor("#990B0B0E"))
+        else:
+            self.backdrop_view.setBackgroundColor(Color.parseColor("#77000000"))
+        self.backdrop_view.setClickable(True)
+        self.backdrop_view.setOnClickListener(self._keep_listener(BackdropClickListener(session_weak)))
+
+        plugin = self.plugin_ref()
+        blur_enabled = plugin.get_setting("blur_backdrop", True) if plugin else True
+        blur_intensity = plugin.get_setting("blur_intensity", 2) if plugin else 2
+
+        # Distinct radii blur an owned snapshot, leaving native views intact.
+
+        self.backdrop_view.setAlpha(0.0)
+        self.overlay_root.addView(self.backdrop_view)
+
+        # 4. Message Preview View
+        self.preview_image = ImageView(context)
+        self.preview_image.setScaleType(ImageView.ScaleType.FIT_XY)
+        preview_lp = FrameLayout.LayoutParams(cell_w, cell_h, Gravity.TOP | Gravity.LEFT)
+        preview_lp.leftMargin = cell_x
+        preview_lp.topMargin = cell_y
+        self.preview_image.setLayoutParams(preview_lp)
+        # Tapping the preview itself dismisses (it is not an action target)
+        try:
+            self.preview_image.setClickable(True)
+            self.preview_image.setOnClickListener(self._keep_listener(BackdropClickListener(session_weak)))
+        except Exception:
+            pass
+        self.overlay_root.addView(self.preview_image)
+
+        is_out = False
+        if message_obj is not None and hasattr(message_obj, "isOutOwner"):
+            try:
+                is_out = bool(message_obj.isOutOwner())
+            except Exception:
+                pass
+
+        # 5. Build Floating Reaction Bar & Action Menu
+
+        reactions_enabled = plugin.get_setting("enable_reactions", True) if plugin else True
+        self._allowed_reactions = _allowed_emojis(chat_activity, self.primary_message)
+        if reactions_enabled and self._allowed_reactions:
+            self.reaction_bar = self._build_reaction_bar(context, is_dark)
+
+        self.context_menu = self._build_action_menu(context, is_dark, message_obj, chat_activity)
+
+        # 6. Layout & Clamping Math
+        self._compute_and_apply_positions(
+            cell_x=cell_x,
+            cell_y=cell_y,
+            cell_w=cell_w,
+            cell_h=cell_h,
+            is_out=is_out,
+            menu_w=self._computed_menu_w,
+            menu_h=self._computed_menu_h,
+        )
+
+        try:
+            self._snapshot_preview(cell, cell_w, source_left, source_top, is_dark)
+            self.preview_image.setImageBitmap(self.preview_bitmap)
+            # Keep the recycler cell untouched. The preview is a cropped copy;
+            # moving it never punches a transparent hole in the chat list.
+            if blur_enabled:
+                self._set_bg_blur(self._blur_radius_for(blur_intensity))
+                if self._blur_target is not None:
+                    # The dimmer and preview were already added. Keep blur
+                    # behind both rather than covering the preview.
+                    self.overlay_root.removeView(self._blur_target)
+                    self.overlay_root.addView(self._blur_target, 0)
+            self._apply_material(is_dark, frosted=self._blur_target is not None)
+        except Exception as error:
+            self._show_failed = True
+            diag(f"show: bounded snapshot failed: {error}")
+            self._cleanup()
+            return
+
+        if self.reaction_bar is not None:
+            self.overlay_root.addView(self.reaction_background)
+            self.overlay_root.addView(self.reaction_bar)
+        if self.context_menu is not None:
+            self.overlay_root.addView(self.context_menu)
+
+        # 7. Attach to window DecorView
+        # Sweep first: if a previous overlay leaked (missed detach), an
+        # invisible full-screen view would still be eating every touch.
+        try:
+            self._sweep_orphan_overlays(decor_view, None)
+        except Exception:
+            pass
+        try:
+            decor_view.addView(self.overlay_root)
+            self.overlay_root.requestFocus()
+        except Exception as error:
+            self._show_failed = True
+            diag(f"show: overlay attachment failed: {error}")
+            self._cleanup()
+            return
+
+        self._setup_accessibility(decor_view)
+        self._install_layout_listener()
+
+        # dispatchTouchEvent runs above disallow-intercept. Only consume the
+        # stream that predates this overlay; new DOWNs go to its real children.
+        if not self._install_touch_interceptor():
+            diag("decor gesture interception unavailable; allowing native menu")
+            self.dismiss(animated=False)
+            return
+
+        # 8. Source-derived message, controls and backdrop choreography.
+        try:
+            self._animate_in()
+        except Exception as e:
+            # The overlay is ALREADY attached to the DecorView at this point.
+            # If the entrance animation throws and we swallow it, we leave a
+            # full-screen, fully transparent, clickable view sitting on top of
+            # the app eating every touch. Tear down instead.
+            self._show_failed = True
+            diag(f"show: _animate_in failed ({type(e).__name__}: {e})")
+            self.dismiss(animated=False)
+
+    def _install_touch_interceptor(self) -> bool:
+        decor, plugin = self.parent_container_owner(), self.plugin_ref()
+        method = _find_declared_method(decor, "dispatchTouchEvent", 1, ["android.view.MotionEvent"])
+        if method is None or plugin is None:
+            return False
+        try:
+            self._dispatch_method = method
+            self._touch_hook = DecorGestureHook(weakref.ref(self))
+            self._touch_unhook = plugin.hook_method(method, self._touch_hook)
+            if self._touch_unhook is None:
+                diag("decor dispatch hook registration returned no handle; native fallback")
+                return False
+            return True
+        except Exception as error:
+            diag(f"decor dispatch hook unavailable: {error}")
+            return False
+
+    def _remove_touch_interceptor(self):
+        if self._touch_unhook is not None:
+            try:
+                plugin = self.plugin_ref() if self.plugin_ref else None
+                if plugin is not None:
+                    plugin.unhook_method(self._touch_unhook)
+                else:
+                    self._touch_unhook.unhook()
+            except Exception as error:
+                diag(f"decor gesture unhook failed; inactive weak handler retained: {error}")
+        self._touch_unhook = self._touch_hook = self._dispatch_method = None
+
+    def _cancel_original_touch(self, event):
+        if self._original_cancelled:
+            return
+        self._original_cancelled = True
+        cancel = None
+        try:
+            cancel = MotionEvent.obtain(event)
+            cancel.setAction(MotionEvent.ACTION_CANCEL)
+            self._dispatch_canceling = True
+            result = _invoke_java_method(self._dispatch_method, self.parent_container_owner(), [cancel])
+            if result != INVOKE_OK:
+                diag("original gesture cancellation unavailable; tail remains consumed")
+        except Exception as error:
+            diag(f"original gesture cancellation failed: {error}")
+        finally:
+            self._dispatch_canceling = False
+            if cancel is not None:
+                cancel.recycle()
+
+    def _track_card_scroll(self, state, event) -> bool:
+        """Manual scroll for gestures whose DOWN predates the ScrollView."""
+        if not self._menu_scrollable:
+            return False
+        x, y = event.getRawX(), event.getRawY()
+        card = self._view_screen_rect(self.context_menu)
+        inside = card and card[0] <= x <= card[2] and card[1] <= y <= card[3]
+        if not inside:
+            state.clear()
+            return False
+        if "start" not in state:
+            state.update(start=(x, y), last=y, scrolling=False)
+            return False
+        dx, dy = x - state["start"][0], y - state["start"][1]
+        if abs(dy) > AndroidUtilities.dp(8) and abs(dy) > abs(dx) * 1.2:
+            state["scrolling"] = True
+        if state["scrolling"] and event.getActionMasked() == MotionEvent.ACTION_MOVE:
+            self.menu_scroll.scrollBy(0, int(state["last"] - y))
+        state["last"] = y
+        return bool(state["scrolling"])
+
+    def _forward_original_touch(self, event):
+        self._cancel_original_touch(event)
+        action = event.getActionMasked()
+        if action == MotionEvent.ACTION_CANCEL or _message_call(event, "getPointerCount", 1) != 1:
+            self._original_aborted = True
+        if self._original_aborted:
+            if action in (MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL):
+                self._original_stream = False
+            self.clear_hover()
+            return
+        if action not in (MotionEvent.ACTION_MOVE, MotionEvent.ACTION_UP):
+            return
+        plugin = self.plugin_ref()
+        slide = plugin is None or plugin.get_setting("slide_select", True)
+        if self._original_start is not None:
+            dx, dy = event.getRawX() - self._original_start[0], event.getRawY() - self._original_start[1]
+            self._original_moved = self._original_moved or dx * dx + dy * dy > AndroidUtilities.dp(8) ** 2
+        elif action == MotionEvent.ACTION_MOVE:
+            self._original_moved = True
+        if slide and self._original_moved:
+            if self._track_card_scroll(self._original_card_drag, event):
+                self.clear_hover()
+            else:
+                self.update_hover(event.getRawX(), event.getRawY(), self.overlay_root, during_entrance=True)
+        if action == MotionEvent.ACTION_UP:
+            self._original_stream = False
+            if slide and self._original_moved and not self._original_card_drag.get("scrolling", False):
+                self.commit_hover_or_dismiss(self.overlay_root)
+            else:
+                self.clear_hover()
+
+    def _recent_emojis(self) -> list:
+        """Read the active Telegram account, including reactions used elsewhere."""
+        chat = self.chat_activity_owner() if self.chat_activity_owner else None
+        ordered, seen = [], set()
+        controller = _message_call(chat, "getMediaDataController", None)
+        for emoji in sorted(_chosen_emojis(self.primary_message)):
+            if emoji:
+                seen.add(emoji)
+                ordered.append(emoji)
+        for getter in ("getRecentReactions", "getTopReactions"):
+            for reaction in _java_array_to_list(_message_call(controller, getter, [])):
+                emoji = _reaction_key(reaction)
+                if emoji and emoji not in seen:
+                    seen.add(emoji)
+                    ordered.append(emoji)
+        # Telegram's configured quick reaction is a useful fallback on a new
+        # account. No separate plugin history: selectReaction(addToRecent=True)
+        # updates the same history used by Telegram's own picker.
+        quick = _message_call(controller, "getDoubleTapReaction", "")
+        for emoji in [quick] + list(getattr(self, "_allowed_reactions", [])):
+            if emoji and emoji not in seen:
+                seen.add(emoji)
+                ordered.append(emoji)
+        return ordered
+
+
+    def _build_reaction_bar(self, context: Any, is_dark: bool) -> LinearLayout:
+        bar = LinearLayout(context)
+        bar.setClipChildren(False)
+        bar.setClipToPadding(False)
+        bar.setOrientation(LinearLayout.HORIZONTAL)
+        bar.setGravity(Gravity.CENTER_VERTICAL)
+        bar.setPadding(
+            AndroidUtilities.dp(8),
+            AndroidUtilities.dp(4),
+            AndroidUtilities.dp(8),
+            AndroidUtilities.dp(4),
+        )
+
+        pill_bg = GradientDrawable()
+        pill_bg.setShape(GradientDrawable.RECTANGLE)
+        pill_bg.setCornerRadius(float(AndroidUtilities.dp(25)))
+        if is_dark:
+            pill_bg.setColor(Color.parseColor("#C6252528"))
+            pill_bg.setStroke(AndroidUtilities.dp(1), Color.parseColor("#50FFFFFF"))
+        else:
+            pill_bg.setColor(Color.parseColor("#D9FFFFFF"))
+            pill_bg.setStroke(AndroidUtilities.dp(1), Color.parseColor("#55FFFFFF"))
+        self._pill_bg = pill_bg
+        # The plate expands independently so the actual reaction hit targets
+        # never become tiny while their glyphs are appearing.
+        self.reaction_background = View(context)
+        self.reaction_background.setBackground(pill_bg)
+        self.reaction_background.setElevation(float(AndroidUtilities.dp(18)))
+        self.reaction_background.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO)
+        bar.setElevation(float(AndroidUtilities.dp(18)))
+
+        allowed = self._allowed_reactions
+        emojis = [e for e in self._recent_emojis() if e in allowed]
+        emojis.extend(e for e in allowed if e not in emojis)
+        capacity = max(1, min(7, (self._window_w - AndroidUtilities.dp(40)) // AndroidUtilities.dp(44)))
+        # Custom emoji must have both a safe factory and a renderable glyph.
+        resolved = []
+        for emoji in emojis:
+            glyph = None
+            if emoji.startswith("animated_"):
+                if _visible_reaction(emoji) is None:
+                    continue
+                glyph = self._custom_reaction_glyph(context, emoji)
+                if glyph is None:
+                    continue
+            resolved.append((emoji, glyph))
+            if len(resolved) >= capacity:
+                break
+        session_weak = weakref.ref(self)
+        self.reaction_views = []
+        self.reaction_halos = []
+        # Real width of the built pill. The layout pass used to hardcode
+        # 7*38dp regardless of how many emojis the MRU list actually held, so
+        # a shorter pill (fewer than 7 recents) was positioned as if it were
+        # full width and the hover rects were misaligned with the card below.
+        self._computed_rx_w = AndroidUtilities.dp(8) * 2
+        self._computed_rx_h = AndroidUtilities.dp(52)
+
+        for idx, (emo, custom_glyph) in enumerate(resolved):
+            container = FrameLayout(context)
+            container.setClipChildren(False)
+            container.setClipToPadding(False)
+            lp = LinearLayout.LayoutParams(AndroidUtilities.dp(44), AndroidUtilities.dp(44))
+
+            container.setLayoutParams(lp)
+            container.setClickable(True)
+            container.setFocusable(True)
+            chosen = emo in _chosen_emojis(self.primary_message)
+            container.setSelected(chosen)
+            container.setContentDescription(emo + " · " + tr("Selected" if chosen else "Reaction", "Selected reaction — tap to remove" if chosen else "React"))
+            if chosen:
+                selected_bg = GradientDrawable()
+                selected_bg.setCornerRadius(float(AndroidUtilities.dp(14)))
+                selected_bg.setColor(Color.parseColor("#44007AFF" if is_dark else "#22007AFF"))
+                container.setBackground(selected_bg)
+            container.setOnClickListener(self._keep_listener(ReactionClickListener(session_weak, emo)))
+
+            halo = View(context)
+            halo_lp = FrameLayout.LayoutParams(AndroidUtilities.dp(34), AndroidUtilities.dp(34), Gravity.CENTER)
+            halo.setLayoutParams(halo_lp)
+            halo_bg = GradientDrawable()
+            halo_bg.setShape(GradientDrawable.OVAL)
+            halo_bg.setColor(Color.parseColor("#33FFFFFF" if is_dark else "#22000000"))
+            halo.setBackground(halo_bg)
+            halo.setAlpha(0.0)
+            halo.setScaleX(0.5)
+            halo.setScaleY(0.5)
+            container.addView(halo)
+
+            tv = custom_glyph if custom_glyph is not None else TextView(context)
+            if custom_glyph is None:
+                tv.setText(emo)
+                # dp, not sp: the 44dp target cannot grow with the font scale.
+                tv.setTextSize(jclass("android.util.TypedValue").COMPLEX_UNIT_DIP, 20.0)
+                tv.setGravity(Gravity.CENTER)
+            size = AndroidUtilities.dp(28) if custom_glyph is not None else FrameLayout.LayoutParams.MATCH_PARENT
+            tv_lp = FrameLayout.LayoutParams(size, size, Gravity.CENTER)
+            tv.setLayoutParams(tv_lp)
+            container.addView(tv)
+
+            container.setOnTouchListener(
+                self._keep_listener(ReactionItemTouchListener(session_weak, idx))
+            )
+
+            bar.addView(container)
+            self.reaction_views.append((container, emo))
+            self.reaction_halos.append((halo, halo_bg, tv))
+            self._computed_rx_w += AndroidUtilities.dp(44)
+
+        # Drag across the pill works too (press-slide-release), same as menu
+        try:
+            plugin = self.plugin_ref()
+            if plugin is None or plugin.get_setting("slide_select", True):
+                bar.setOnTouchListener(self._keep_listener(DragSelectTouchListener(session_weak)))
+        except Exception:
+            pass
+
+        return bar
+
+    def _custom_reaction_glyph(self, context, key):
+        try:
+            drawable_class = find_class("org.telegram.ui.Components.AnimatedEmojiDrawable")
+            constructors = _java_array_to_list(drawable_class.getDeclaredConstructors())
+            matches = [c for c in constructors if
+                       [str(t.getName()) for t in _java_array_to_list(c.getParameterTypes())] == ["int", "int", "long"]]
+            if len(matches) != 1:
+                diag_once("custom-constructor", "custom emoji exact (int,int,long) constructor unavailable; skipping")
+                return None
+            drawable_type = jclass("org.telegram.ui.Components.AnimatedEmojiDrawable")
+            cache_type = drawable_type.CACHE_TYPE_ALERT_PREVIEW
+            account = self.chat_activity_owner().getCurrentAccount()
+            constructor = matches[0]
+            constructor.setAccessible(True)
+            drawable = constructor.newInstance(jarray(jclass("java.lang.Object"))(
+                [jint(cache_type), jint(account), jlong(int(key[9:]))]))
+            glyph = jclass("org.telegram.ui.Components.BackupImageView")(context)
+            setter = _find_declared_method(glyph, "setAnimatedEmojiDrawable", 1,
+                                           ["org.telegram.ui.Components.AnimatedEmojiDrawable"])
+            if _invoke_java_method(setter, glyph, [drawable]) != INVOKE_OK:
+                return None
+            self._custom_glyphs.append(glyph)
+            return glyph
+        except Exception as error:
+            diag_once("custom-glyph", f"custom emoji rendering unavailable; skipping: {error}")
+            return None
+
+    def _build_action_menu(self, context: Any, is_dark: bool,
+                           message_obj: Any = None, chat_activity: Any = None) -> Any:
+        menu = LinearLayout(context)
+        menu.setOrientation(LinearLayout.VERTICAL)
+        # Keep essential actions compact. The full localized native menu is
+        # always available, including Translate, links, polls and plugin items.
+        essential = {OPTION_REPLY, OPTION_COPY, OPTION_FORWARD, OPTION_EDIT,
+                     OPTION_PIN, OPTION_UNPIN, OPTION_DELETE,
+                     OPTION_SAVE_TO_GALLERY, OPTION_SAVE_TO_GALLERY2,
+                     OPTION_SAVE_TO_DOWNLOADS_OR_MUSIC, OPTION_ADD_TO_GIFS}
+        items = [item for item in self.native_items if item[2] in essential]
+        # Native order puts Delete in different places; keep it last.
+        items = [i for i in items if not i[3]] + [i for i in items if i[3]]
+        items.append((tr("Select", "Select"), 0, OPTION_SELECT_MESSAGE, False))
+        items.append((tr("More", "More actions…"), 0, OPTION_NATIVE_MENU, False))
+        self._menu_is_dark = is_dark
+        self._computed_menu_w = min(AndroidUtilities.dp(256), self._window_w - AndroidUtilities.dp(24))
+        row_h = AndroidUtilities.dp(48)
+        divider_h = max(1, AndroidUtilities.dp(1))
+        self._computed_menu_h = len(items) * row_h + (len(items) - 1) * divider_h
+        normal = Color.parseColor("#F5F5F7" if is_dark else "#1C1C1E")
+        destructive = Color.parseColor("#FF453A" if is_dark else "#FF3B30")
+        session_ref = weakref.ref(self)
+        self.menu_rows = []
+        self._row_backgrounds = []
+        for index, (title, icon, option, is_destructive) in enumerate(items):
+            if index:
+                divider = View(context)
+                divider.setBackgroundColor(Color.parseColor("#22FFFFFF" if is_dark else "#14000000"))
+                divider_lp = LinearLayout.LayoutParams(-1, divider_h)
+                divider_lp.leftMargin = AndroidUtilities.dp(16)
+                divider_lp.rightMargin = AndroidUtilities.dp(16)
+                menu.addView(divider, divider_lp)
+            row = FrameLayout(context)
+            row.setClickable(True)
+            row.setFocusable(True)
+            row.setContentDescription(title)
+            background = self._pressed_background(is_dark)
+            if background is not None:
+                row.setBackground(background)
+            self._row_backgrounds.append(background)
+            row.setOnClickListener(self._keep_listener(MenuActionClickListener(session_ref, option)))
+            row.setOnTouchListener(self._keep_listener(ActionRowTouchListener(session_ref)))
+            title_tv = TextView(context)
+            title_tv.setText(title)
+            title_tv.setTextSize(16.0)
+            title_tv.setSingleLine(True)
+            try:
+                title_tv.setEllipsize(jclass("android.text.TextUtils$TruncateAt").END)
+            except Exception as error:
+                diag_once("ellipsize", f"title ellipsize unavailable: {error}")
+            title_tv.setTextColor(destructive if is_destructive else normal)
+            title_lp = FrameLayout.LayoutParams(-1, -2, Gravity.START | Gravity.CENTER_VERTICAL)
+            try:
+                title_lp.setMarginStart(AndroidUtilities.dp(16))
+                title_lp.setMarginEnd(AndroidUtilities.dp(52))
+            except Exception as error:
+                diag_once("rtl-margins", f"relative title margins unavailable: {error}")
+                title_lp.leftMargin = AndroidUtilities.dp(16)
+                title_lp.rightMargin = AndroidUtilities.dp(52)
+            row.addView(title_tv, title_lp)
+            icon_view = ImageView(context) if icon else TextView(context)
+            if icon:
+                icon_view.setImageResource(icon)
+                icon_view.setColorFilter(destructive if is_destructive else normal)
+            else:
+                icon_view.setText("✓" if option == OPTION_SELECT_MESSAGE else "•••")
+                icon_view.setGravity(Gravity.CENTER)
+                icon_view.setTextColor(normal)
+                icon_view.setTextSize(18.0)
+            icon_lp = FrameLayout.LayoutParams(AndroidUtilities.dp(24), AndroidUtilities.dp(24), Gravity.END | Gravity.CENTER_VERTICAL)
+            try:
+                icon_lp.setMarginEnd(AndroidUtilities.dp(16))
+            except Exception as error:
+                diag_once("rtl-icon", f"relative icon margin unavailable: {error}")
+                icon_lp.rightMargin = AndroidUtilities.dp(16)
+            row.addView(icon_view, icon_lp)
+            menu.addView(row, LinearLayout.LayoutParams(-1, row_h))
+            self.menu_rows.append((row, option))
+        scroll = ScrollView(context)
+        scroll.setFillViewport(False)
+        scroll.setVerticalScrollBarEnabled(False)
+        scroll.addView(menu)
+        card_bg = GradientDrawable()
+        card_bg.setCornerRadius(float(min(AndroidUtilities.dp(30), max(AndroidUtilities.dp(12), self._computed_menu_h // 2))))
+        card_bg.setColor(Color.parseColor("#C92B2B31" if is_dark else "#D9F9F9FC"))
+        card_bg.setStroke(max(1, AndroidUtilities.dp(1)), Color.parseColor("#50FFFFFF" if is_dark else "#66FFFFFF"))
+        self._card_bg = card_bg
+        scroll.setBackground(card_bg)
+        scroll.setElevation(float(AndroidUtilities.dp(18)))
+        scroll.setClipToOutline(True)
+        self.menu_scroll = scroll
+        return scroll
+
+
+    def _compute_and_apply_positions(self, cell_x: int, cell_y: int,
+                                     cell_w: int, cell_h: int, is_out: bool,
+                                     menu_w: int = 0, menu_h: int = 0) -> None:
+        padding, gap = AndroidUtilities.dp(12), AndroidUtilities.dp(10)
+        left, top, right, bottom = self._usable_bounds
+        top, bottom = top + padding, bottom - padding
+        usable_h = max(1, bottom - top)
+        rx_h = self._computed_rx_h if self.reaction_bar is not None else 0
+        rx_w = self._computed_rx_w if self.reaction_bar is not None else 0
+        menu_w = min(menu_w, max(1, right - left - padding * 2))
+        # On short windows retain 48dp rows and scroll rather than clipping
+        # Delete or shrinking touch targets. Leave a small preview when possible.
+        menu_visible_h = min(menu_h, max(AndroidUtilities.dp(48), int(usable_h * 0.60)))
+        menu_visible_h = min(menu_visible_h, max(1, usable_h - rx_h - gap * 2))
+        room = max(1, usable_h - menu_visible_h - rx_h - gap * (2 if rx_h else 1))
+        # Width sets text scale. Height clips with a fade, never rescales an
+        # entire tall message to fit between the controls.
+        scale = min(1.0, max(1, right - left - padding * 2) / float(max(1, cell_w)),
+                    4096.0 / float(max(1, cell_w)))
+        pw = max(1, int(cell_w * scale))
+        ph = max(1, min(int(cell_h * scale), int(room), 4096, (8 * 1024 * 1024) // (4 * pw)))
+        self._preview_scale = scale
+        self._preview_cropped = cell_h * scale > ph + 1
+        total = ph + menu_visible_h + gap + (rx_h + gap if rx_h else 0)
+        block_top = max(top, min(cell_y - (rx_h + gap if rx_h else 0), bottom - total))
+        preview_y = block_top + (rx_h + gap if rx_h else 0)
+        preview_x = max(left + padding, min(cell_x, right - padding - pw))
+        if self._bubble_cropped:
+            # Anchor to the displayed bubble, as Telegram-iOS does for an
+            # extracted message (.default alignment, fb0e62ba8a14):
+            # ContextControllerExtractedPresentationNode puts the card's left
+            # edge at content.minX + 6 - 4 when the bubble's centre is in the
+            # left half, otherwise its right edge at content.maxX - 6 - 1.
+            # ReactionContextNode.calculateBackgroundFrame ends the tray 22pt
+            # past a left-side bubble's right edge, or starts it 22 + 4pt
+            # before a right-side bubble. Screen geometry also covers RTL.
+            content_l, content_r = preview_x, preview_x + pw
+            if content_l + content_r < left + right:
+                aligned_x = content_l + AndroidUtilities.dp(2)
+            else:
+                aligned_x = content_r - AndroidUtilities.dp(7) - menu_w
+            if content_l - left < right - content_r:
+                rx_x = content_r + AndroidUtilities.dp(22) - rx_w
+            else:
+                rx_x = content_l - AndroidUtilities.dp(26)
+        else:
+            # Full-cell fallback: the row spans the list, so its centre says
+            # nothing about the side. Keep direction-aware edge alignment.
+            cell = self.cell_owner() if self.cell_owner else None
+            direction = _message_call(self._chat_list if getattr(self, "_chat_list", None) is not None else cell,
+                                      "getLayoutDirection", _message_call(cell, "getLayoutDirection", 0))
+            align_right = bool(is_out) != (int(direction) == 1)
+            aligned_x = right - padding - menu_w if align_right else left + padding
+            rx_x = right - padding - rx_w if align_right else left + padding
+        menu_x = max(left + padding, min(aligned_x, right - padding - menu_w))
+        rx_x = max(left + padding, min(rx_x, right - padding - rx_w))
+        if self.preview_image is not None:
+            lp = FrameLayout.LayoutParams(pw, ph, Gravity.TOP | Gravity.LEFT)
+            lp.leftMargin, lp.topMargin = int(preview_x), int(preview_y)
+            self.preview_image.setLayoutParams(lp)
+        if self.reaction_bar is not None:
+            lp = FrameLayout.LayoutParams(rx_w, rx_h, Gravity.TOP | Gravity.LEFT)
+            lp.leftMargin, lp.topMargin = int(rx_x), int(block_top)
+            self.reaction_bar.setLayoutParams(lp)
+            bg_lp = FrameLayout.LayoutParams(rx_w, rx_h, Gravity.TOP | Gravity.LEFT)
+            bg_lp.leftMargin, bg_lp.topMargin = int(rx_x), int(block_top)
+            self.reaction_background.setLayoutParams(bg_lp)
+        lp = FrameLayout.LayoutParams(menu_w, menu_visible_h, Gravity.TOP | Gravity.LEFT)
+        lp.leftMargin, lp.topMargin = int(menu_x), int(preview_y + ph + gap)
+        self.context_menu.setLayoutParams(lp)
+        self._menu_scrollable = menu_visible_h < menu_h
+        # Row listeners own taps and horizontal slides; vertical drags scroll
+        # explicitly. They also remain alive when slide selection is disabled.
+        self._resolved_cell_x, self._resolved_cell_y = int(preview_x), int(preview_y)
+
+
+    def _bubble_bounds(self, cell, source_w, source_h):
+        """Read Telegram's drawn bubble rectangle; return None on API drift."""
+        message = _message_call(cell, "getMessageObject", None)
+        if bool(_message_call(message, "shouldDrawWithoutBackground", False)):
+            return None
+        names = ("getBackgroundDrawableLeft", "getBackgroundDrawableTop",
+                 "getBackgroundDrawableRight", "getBackgroundDrawableBottom")
+        values = []
+        try:
+            for name in names:
+                method = getattr(cell, name)
+                if not callable(method):
+                    return None
+                values.append(int(method()))
+        except Exception:
+            return None
+        left, top, right, bottom = values
+        # ChatMessageCell.onDraw translates by its top padding (stars price,
+        # suggestion offer and topic separator; setPadding uses the same sum)
+        # before drawBackgroundInternal. The getters are pre-translation, so
+        # without this the crop is shifted up on paid/forum-separator rows.
+        try:
+            padding_top = int(_message_call(cell, "getPaddingTop", 0) or 0)
+        except Exception:
+            padding_top = 0
+        top, bottom = top + padding_top, bottom + padding_top
+        left, right = max(0, left), min(int(source_w), right)
+        top, bottom = max(0, top), min(int(source_h), bottom)
+        if right - left < AndroidUtilities.dp(24) or bottom - top < AndroidUtilities.dp(16):
+            return None
+        return left, top, right, bottom
+
+    def _draw_parent_owned_background(self, cell, canvas):
+        """Gradient outgoing bubbles are painted by the chat list, not the cell.
+
+        ChatMessageCell.drawBackgroundInParent() is true for outgoing messages
+        when the theme has key_chat_outBubbleGradient1, and drawBackgroundInternal
+        (fromParent=false) then returns early. Telegram's own scrim rendering in
+        ChatActivity draws a lone non-grouped cell by translating to its top
+        padding, calling drawBackgroundInternal(canvas, true), then draw().
+        Optional: older forks without these methods keep the cell-only copy.
+        """
+        try:
+            group_getter = getattr(cell, "getCurrentMessagesGroup", None)
+            # Only draw a parent-owned bubble when the fork lets us prove this
+            # is a standalone message. If the group API is absent, the safe
+            # fallback is the cell's own rendering path.
+            if not callable(group_getter) or group_getter() is not None:
+                return
+            if not _as_bool(_message_call(cell, "drawBackgroundInParent", False)):
+                return
+            canvas.save()
+            try:
+                canvas.translate(0.0, float(_message_call(cell, "getPaddingTop", 0) or 0))
+                cell.drawBackgroundInternal(canvas, True)
+            finally:
+                canvas.restore()
+        except Exception as error:
+            diag_once("parent-bubble", f"parent-drawn bubble background unavailable: {error}")
+
+    def _apply_material(self, is_dark, frosted):
+        """Translucent fills only over the owned blur, as Telegram-iOS does.
+
+        NavigationBackgroundView.updateColor uses color.withAlphaComponent(1.0)
+        when its blur is unavailable (Reduce Transparency). Without our blur
+        (setting off, Android < 12, or capture failure) the chat behind the
+        card is sharp, so keep the panels opaque for legibility.
+        """
+        if frosted:
+            return
+        try:
+            if self._card_bg is not None:
+                self._card_bg.setColor(Color.parseColor("#FF2B2B31" if is_dark else "#FFF9F9FC"))
+                self._card_bg.setStroke(max(1, AndroidUtilities.dp(1)),
+                                        Color.parseColor("#20FFFFFF" if is_dark else "#10000000"))
+            if self._pill_bg is not None:
+                self._pill_bg.setColor(Color.parseColor("#FF252528" if is_dark else "#FFFFFFFF"))
+                self._pill_bg.setStroke(AndroidUtilities.dp(1),
+                                        Color.parseColor("#25FFFFFF" if is_dark else "#18000000"))
+        except Exception as error:
+            diag_once("solid-material", f"opaque panel fallback unavailable: {error}")
+
+    def _snapshot_preview(self, cell, source_w, source_left, source_top, is_dark):
+        lp = self.preview_image.getLayoutParams()
+        width, height = int(lp.width), int(lp.height)
+        # 4096px texture edges and an 8 MiB preview allocation ceiling.
+        if width > 4096 or height > 4096 or width * height * 4 > 8 * 1024 * 1024:
+            raise RuntimeError("preview exceeded snapshot limits")
+        self.preview_bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        canvas = Canvas(self.preview_bitmap)
+        scale = width / float(max(1, source_w))
+        canvas.save()
+        try:
+            canvas.scale(scale, scale)
+            canvas.translate(float(-source_left), float(-source_top))
+            self._draw_parent_owned_background(cell, canvas)
+            cell.draw(canvas)
+        finally:
+            canvas.restore()
+        if self._preview_cropped:
+            # Fade the snapshot's own alpha at the crop edge (DST_OUT), so it
+            # dissolves into whatever is behind it instead of ending in a
+            # fixed-colour band. Optional drawing APIs can fail without
+            # abandoning the native-menu fallback.
+            try:
+                fade = min(height, AndroidUtilities.dp(28))
+                paint = jclass("android.graphics.Paint")()
+                gradient = jclass("android.graphics.LinearGradient")(
+                    jfloat(0), jfloat(height - fade), jfloat(0), jfloat(height),
+                    jint(Color.TRANSPARENT), jint(Color.BLACK),
+                    jclass("android.graphics.Shader$TileMode").CLAMP)
+                paint.setShader(gradient)
+                paint.setXfermode(jclass("android.graphics.PorterDuffXfermode")(
+                    jclass("android.graphics.PorterDuff$Mode").DST_OUT))
+                canvas.drawRect(jfloat(0), jfloat(height - fade), jfloat(width), jfloat(height), paint)
+            except Exception as error:
+                diag_once("crop-fade", f"crop fade unavailable; bounded crop retained: {error}")
+
+    def _setup_accessibility(self, decor):
+        try:
+            self.overlay_root.setAccessibilityPaneTitle(tr("MessageOptions", "Message actions"))
+            text = str(_read_field(self.message_obj, "messageText", ""))[:280]
+            self.preview_image.setContentDescription(tr("Message", "Message preview") + (": " + text if text else ""))
+        except Exception as error:
+            diag_once("a11y-pane", f"accessibility labels unavailable: {error}")
+        for index in range(decor.getChildCount()):
+            child = decor.getChildAt(index)
+            if child == self.overlay_root:
+                continue
+            try:
+                importance = child.getImportantForAccessibility()
+                self._a11y_hidden.append((child, importance))
+                child.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS)
+            except Exception as error:
+                diag_once("a11y-chat", f"chat accessibility isolation unavailable: {error}")
+
+    def _install_layout_listener(self):
+        global _LAYOUT_PROXY_CLASS
+        try:
+            if _LAYOUT_PROXY_CLASS is None:
+                class LayoutListener(dynamic_proxy(View.OnLayoutChangeListener)):
+                    def __init__(self, session_ref):
+                        super().__init__()
+                        self.session_ref = session_ref
+
+                    def onLayoutChange(self, *args):
+                        session = self.session_ref()
+                        if session is not None and session.is_active():
+                            session._hit_rects = None
+                            decor = session.parent_container_owner()
+                            if decor is not None and (decor.getWidth() != session._window_w or decor.getHeight() != session._window_h):
+                                diag("overlay window changed; restoring native chat")
+                                session.dismiss(animated=False)
+                _LAYOUT_PROXY_CLASS = LayoutListener
+            self._layout_listener = _LAYOUT_PROXY_CLASS(weakref.ref(self))
+            self.overlay_root.addOnLayoutChangeListener(self._layout_listener)
+        except Exception as error:
+            diag_once("layout-listener", f"layout invalidation unavailable; using post-layout cache: {error}")
+
+    def _animate_in(self) -> None:
+        plugin = self.plugin_ref()
+        reduced = _motion_reduced(plugin, self.parent_container_owner())
+        spring = bool(plugin.get_setting("spring_physics", True)) if plugin else True
+        self._reduce_motion = reduced
+        self._motion_generation += 1
+        generation = self._motion_generation
+        self._entrance_running = not reduced
+        # Completion, rather than a fixed timeout, follows Android's animation
+        # duration scale. Hit geometry stays live throughout the entrance.
+        self._interaction_ready_ms = 0.0
+        session_ref = weakref.ref(self)
+
+        def opened():
+            session = session_ref()
+            if (session is not None and session.is_active()
+                    and session._motion_generation == generation):
+                session._entrance_running = False
+                session._hit_rects = None
+                session._cache_hit_rects()
+
+        if reduced:
+            self.backdrop_view.setAlpha(1.0)
+            if self._blur_target is not None:
+                self._blur_target.setAlpha(1.0)
+            run_on_ui_thread(opened, 1)
+            return
+
+        curve = _ios_interpolator("spring") if spring else DecelerateInterpolator()
+        reaction_curve = _ios_interpolator("reaction") if spring else DecelerateInterpolator()
+        source_x, source_y, source_w, _ = self._source_rect
+        dx = float(source_x - self._resolved_cell_x)
+        dy = float(source_y - self._resolved_cell_y)
+        self.preview_image.setPivotX(0.0)
+        self.preview_image.setPivotY(0.0)
+        self.preview_image.setTranslationX(dx)
+        self.preview_image.setTranslationY(dy)
+        initial_scale = source_w / float(max(1, self.preview_image.getLayoutParams().width))
+        self.preview_image.setScaleX(initial_scale)
+        self.preview_image.setScaleY(initial_scale)
+        self._move_view(self.preview_image, 0.0, 0.0, 1.0, 1.0,
+                        IOS_OPEN_MS, curve, on_end=opened)
+
+        self._fade_view(self.backdrop_view, 1.0, IOS_BACKDROP_MS)
+        if self._blur_target is not None:
+            self._blur_target.setAlpha(0.0)
+            self._fade_view(self._blur_target, 1.0, IOS_BACKDROP_MS)
+
+        # iOS extracted presentation: center-scale 0.01 -> 1, with the
+        # collapsed card at the message's lower edge; side alignment is kept.
+        menu = self.context_menu
+        lp = menu.getLayoutParams()
+        menu.setPivotX(float(lp.width) * 0.5)
+        menu.setPivotY(float(lp.height) * 0.5)
+        self._actions_origin = (0.0, dy - float(lp.height) * 0.5 - AndroidUtilities.dp(10))
+        menu.setTranslationX(self._actions_origin[0])
+        menu.setTranslationY(self._actions_origin[1])
+        menu.setScaleX(0.01)
+        menu.setScaleY(0.01)
+        menu.setAlpha(0.0)
+        self._move_view(menu, 0.0, 0.0, 1.0, 1.0, IOS_OPEN_MS, curve)
+        self._fade_view(menu, 1.0, IOS_ACTION_FADE_MS)
+
+        if self.reaction_bar is not None:
+            # Stable-sized content container follows the message's vertical
+            # lift. Only the plate and glyphs scale, so selection remains usable.
+            bar = self.reaction_bar
+            bar.setTranslationY(dy)
+            bar.setAlpha(0.0)
+            self._move_view(bar, 0.0, 0.0, 1.0, 1.0, IOS_OPEN_MS, curve)
+            self._fade_view(bar, 1.0, 150)
+
+            plate = self.reaction_background
+            plate_lp = plate.getLayoutParams()
+            plate.setPivotX(float(plate_lp.width) * 0.5)
+            plate.setPivotY(float(plate_lp.height) * 0.5)
+            plate.setTranslationY(dy)
+            plate.setScaleX(min(1.0, float(plate_lp.height) / max(1, plate_lp.width)))
+            plate.setScaleY(1.0)
+            plate.setAlpha(0.0)
+            # Lift with the content immediately; delay only the width expansion.
+            self._move_view(plate, 0.0, 0.0, None, None, IOS_OPEN_MS, curve)
+            self._animate_property(plate, "scaleX", 1.0, 500, curve, delay=110)
+            self._fade_view(plate, 1.0, 150)
+
+            # ReactionContextNode's fallback wave: 10 ms + index * 60 ms.
+            # Built-in iOS animated assets are represented by Android glyphs;
+            # custom-reaction scale uses the source's 400 ms / damping 88 spring.
+            for index, (_halo, _halo_bg, glyph) in enumerate(self.reaction_halos):
+                glyph.setScaleX(0.01)
+                glyph.setScaleY(0.01)
+                self._move_view(glyph, 0.0, 0.0, 1.0, 1.0,
+                                IOS_REACTION_MS, reaction_curve, delay=10 + index * 60)
+
+    def _move_view(self, view, x, y, sx, sy, duration, curve, delay=0, on_end=None):
+        """Native transform animator, explicitly resetting reused animator state."""
+        animator = view.animate()
+        animator.cancel()
+        animator.setStartDelay(int(delay))
+        animator.setDuration(int(duration))
+        animator.setInterpolator(curve)
+        animator.withEndAction(None)
+        animator.translationX(float(x)).translationY(float(y))
+        if sx is not None:
+            animator.scaleX(float(sx))
+        if sy is not None:
+            animator.scaleY(float(sy))
+        if on_end is not None:
+            callback = R(on_end)
+            self._motion_callbacks.append(callback)
+            animator.withEndAction(callback)
+        animator.start()
+
+    def _fade_view(self, view, alpha, duration):
+        # ViewPropertyAnimator has one duration/curve for all of its properties.
+        # A separate ObjectAnimator lets a 50 ms fade share a 420 ms transform.
+        self._animate_property(view, "alpha", alpha, duration, _ios_interpolator("ease"))
+
+    def _animate_property(self, view, property_name, value, duration, curve, delay=0):
+        getter, setter = {"alpha": ("getAlpha", "setAlpha"),
+                          "scaleX": ("getScaleX", "setScaleX")}[property_name]
+        try:
+            cls = jclass("android.animation.ObjectAnimator")
+            animator = cls.ofFloat(view, property_name, jarray(jfloat)([
+                float(getattr(view, getter)()), float(value)]))
+            animator.setDuration(int(duration))
+            animator.setStartDelay(int(delay))
+            animator.setInterpolator(curve)
+            self._property_animators.append(animator)
+            animator.start()
+        except Exception as error:
+            diag_once("motion-property:" + property_name, f"independent {property_name} unavailable; showing endpoint: {error}")
+            getattr(view, setter)(float(value))
+
+    def _cancel_motion(self):
+        """Cancel delayed and running work before dismissal or bitmap teardown."""
+        self._motion_generation += 1
+        self._entrance_running = False
+        for animator in self._property_animators:
+            try:
+                animator.cancel()
+                animator.removeAllListeners()
+            except Exception as error:
+                diag_once("cancel-property", f"property animation cancellation: {error}")
+        self._property_animators.clear()
+        views = [self.overlay_root, self.preview_image, self.backdrop_view, self._blur_target,
+                 self.reaction_bar, self.reaction_background, self.context_menu]
+        views.extend(container for container, _ in self.reaction_views)
+        views.extend(halo for halo, _, _ in self.reaction_halos)
+        views.extend(glyph for _, _, glyph in self.reaction_halos)
+        for view in views:
+            if view is not None:
+                try:
+                    animator = view.animate()
+                    animator.cancel()
+                    animator.setStartDelay(0)
+                    animator.withEndAction(None)
+                except Exception as error:
+                    diag_once("cancel-transform", f"transform cancellation: {error}")
+        self._motion_callbacks.clear()
+        self._hit_rects = None
+
+    def _return_to_source(self):
+        """Sample a still-bound cell in the current window; never animate to a recycled one."""
+        cell = self.cell_owner() if self.cell_owner else None
+        decor = self.parent_container_owner() if self.parent_container_owner else None
+        if cell is None or decor is None:
+            return None
+        try:
+            if (cell.getParent() is None or not cell.isAttachedToWindow()
+                    or cell.getMessageObject() != self.message_obj):
+                return None
+            width, height = int(cell.getWidth()), int(cell.getHeight())
+            if (width, height) != self._source_cell_size:
+                return None
+            source, origin = jarray(jint)([0, 0]), jarray(jint)([0, 0])
+            cell.getLocationInWindow(source)
+            decor.getLocationInWindow(origin)
+            x = int(source[0] - origin[0]) + self._snapshot_origin_x
+            y = int(source[1] - origin[1]) + self._snapshot_origin_y
+            if y >= self._usable_bounds[3] or y + self._source_rect[3] <= self._usable_bounds[1]:
+                return None
+            scale = self._source_rect[2] / float(max(1, self.preview_image.getLayoutParams().width))
+            return float(x - self._resolved_cell_x), float(y - self._resolved_cell_y), scale
+        except Exception as error:
+            diag_once("return-source", f"source geometry unavailable; fading preview: {error}")
+            return None
+
+    def _animate_out(self):
+        # Cancelling preserves the displayed transform, so a close during the
+        # opening spring starts here rather than snapping to the rest position.
+        self._cancel_motion()
+        generation = self._motion_generation
+        session_ref = weakref.ref(self)
+
+        def closed():
+            session = session_ref()
+            if (session is not None and session._motion_generation == generation
+                    and session.is_dismissing and not session._cleanup_done):
+                session._cleanup()
+
+        curve = _ios_interpolator("ease")
+        destination = self._return_to_source()
+        preview = self.preview_image
+        if destination is not None:
+            x, y, scale = destination
+            self._move_view(preview, x, y, scale, scale, IOS_CLOSE_MS, curve)
+        else:
+            self._move_view(preview, preview.getTranslationX(), preview.getTranslationY(),
+                            preview.getScaleX(), preview.getScaleY(), IOS_CLOSE_MS, curve)
+            self._fade_view(preview, 0.0, IOS_CLOSE_MS)
+
+        self._fade_view(self.backdrop_view, 0.0, IOS_CLOSE_MS)
+        if self._blur_target is not None:
+            self._fade_view(self._blur_target, 0.0, IOS_CLOSE_MS)
+
+        menu = self.context_menu
+        source_dy = destination[1] if destination is not None else self._source_rect[1] - self._resolved_cell_y
+        menu_y = source_dy - float(menu.getLayoutParams().height) * 0.5 - AndroidUtilities.dp(10)
+        self._move_view(menu, 0.0, menu_y, 0.01, 0.01, IOS_CLOSE_MS, curve)
+        self._fade_view(menu, 0.0, IOS_CLOSE_MS)
+        if self.reaction_bar is not None:
+            self._move_view(self.reaction_bar, 0.0, source_dy, 1.0, 1.0, IOS_CLOSE_MS, curve)
+            self._fade_view(self.reaction_bar, 0.0, IOS_CLOSE_MS)
+            plate = self.reaction_background
+            lp = plate.getLayoutParams()
+            collapsed = min(1.0, float(lp.height) / max(1, lp.width))
+            self._move_view(plate, 0.0, source_dy, collapsed, 1.0, IOS_CLOSE_MS, curve)
+            self._fade_view(plate, 0.0, IOS_CLOSE_MS)
+
+        # Start the completion clock last, so cleanup cannot recycle an image
+        # while another native animator is still drawing the final fade frame.
+        root = self.overlay_root
+        self._move_view(root, root.getTranslationX(), root.getTranslationY(),
+                        root.getScaleX(), root.getScaleY(), IOS_CLOSE_MS, curve, on_end=closed)
+
+        # A main-thread cleanup watchdog covers a detached/cancelled animation.
+        # Respect nonzero Android duration scale as well as Reduce Motion.
+        scale = 1.0
+        try:
+            decor = self.parent_container_owner()
+            settings = jclass("android.provider.Settings$Global")
+            scale = float(settings.getFloat(decor.getContext().getContentResolver(),
+                                            settings.ANIMATOR_DURATION_SCALE, 1.0))
+        except Exception as error:
+            diag_once("motion-watchdog", f"using default cleanup deadline: {error}")
+        run_on_ui_thread(closed, max(300, int(IOS_CLOSE_MS * max(0.0, scale) + 150)))
+
+
+    def _hl(self) -> int:
+        try:
+            plugin = self.plugin_ref() if self.plugin_ref else None
+            return haptic_level_for(plugin)
+        except Exception:
+            return 2
+
+    # --- Real background blur (frosted glass behind overlay) ---
+
+    def _sweep_orphan_overlays(self, decor_view: Any, keep_view: Any) -> None:
+        """Remove leaked peek overlays (same tag, not the live one).
+
+        If any previous detach failed, an invisible full-screen view stays
+        on top eating every touch — the app looks alive but nothing is
+        tappable. This guarantees at most one overlay exists.
+        """
+        try:
+            count = decor_view.getChildCount()
+        except Exception:
+            return
+        for i in range(count - 1, -1, -1):
+            try:
+                child = decor_view.getChildAt(i)
+                if child is None or child is keep_view:
+                    continue
+                try:
+                    tag = child.getTag()
+                except Exception:
+                    continue
+                if tag is not None and str(tag) == "ios_peek_menu_overlay":
+                    decor_view.removeView(child)
+            except Exception:
+                continue
+
+    def _blur_radius_for(self, intensity: Any) -> float:
+        try:
+            index = max(0, min(3, int(intensity)))
+        except Exception:
+            index = 1
+        return float(AndroidUtilities.dp([8, 16, 24, 32][index]))
+
+
+    def _blur_view(self, chat_activity: Any) -> Any:
+        """The view whose contents get frosted. Never raises."""
+        if chat_activity is None:
+            return None
+        # Target the entire fragmentView so Action Bar, chat header, input panel,
+        # and messages are all heavily blurred into a uniform iOS frosted backdrop.
+        for getter in ("getFragmentView", "getChatListView"):
+            try:
+                if hasattr(chat_activity, getter):
+                    view = getattr(chat_activity, getter)()
+                    if view is not None:
+                        return view
+            except Exception:
+                continue
+        return None
+
+    def _set_bg_blur(self, radius: float) -> None:
+        """Blur our own reduced snapshot; never change Telegram's render effect."""
+        if RenderEffect is None or Shader is None or Build.VERSION.SDK_INT < 31:
+            return
+        bitmap = None
+        try:
+            target = self._blur_view(self.chat_activity_owner())
+            if target is None or target.getWidth() <= 0 or target.getHeight() <= 0:
+                return
+            # Blur does not need a full-resolution image. Keep its owned
+            # bitmap under 1.5 MiB and 1536 px per edge to reduce UI capture
+            # time, allocation pressure, and GPU blur bandwidth. ARGB_8888,
+            # not RGB_565: 565 has 32 red/blue levels (Android documents a
+            # possible greenish tint without dithering), which a blur spreads
+            # into visible bands over gradient wallpapers, and it has no alpha
+            # for the chat-list fallback target. The 0.25 factor binds first
+            # on typical phones, so 565 saved bytes without adding resolution.
+            factor = min(0.25, 1536.0 / target.getWidth(), 1536.0 / target.getHeight(),
+                         (1.5 * 1024 * 1024 / float(4 * target.getWidth() * target.getHeight())) ** 0.5)
+            bitmap = Bitmap.createBitmap(max(1, int(target.getWidth() * factor)),
+                                         max(1, int(target.getHeight() * factor)), Bitmap.Config.ARGB_8888)
+            canvas = Canvas(bitmap)
+            # Per-axis scale from the truncated bitmap size, so FIT_XY maps the
+            # capture exactly back onto the target bounds without edge drift.
+            canvas.scale(bitmap.getWidth() / float(target.getWidth()),
+                         bitmap.getHeight() / float(target.getHeight()))
+            target.draw(canvas)
+            image = ImageView(target.getContext())
+            self._blur_target, self._blur_bitmap = image, bitmap
+            image.setImageBitmap(bitmap)
+            image.setScaleType(ImageView.ScaleType.FIT_XY)
+            image.setRenderEffect(RenderEffect.createBlurEffect(radius, radius, Shader.TileMode.CLAMP))
+            loc, origin = jarray(jint)([0, 0]), jarray(jint)([0, 0])
+            target.getLocationInWindow(loc)
+            self.parent_container_owner().getLocationInWindow(origin)
+            lp = FrameLayout.LayoutParams(target.getWidth(), target.getHeight(), Gravity.TOP | Gravity.LEFT)
+            lp.leftMargin, lp.topMargin = int(loc[0] - origin[0]), int(loc[1] - origin[1])
+            self.overlay_root.addView(image, lp)
+            self._blur_target, self._blur_bitmap = image, bitmap
+        except Exception as error:
+            diag_once("snapshot-blur", f"snapshot blur unavailable; using dimmer: {error}")
+            if self._blur_bitmap is bitmap:
+                self._clear_bg_blur()
+            elif bitmap is not None:
+                self._recycle_owned_bitmap(bitmap, "failed blur")
+
+
+    def _recycle_owned_bitmap(self, bitmap, label):
+        if bitmap is not None:
+            try:
+                bitmap.recycle()
+            except Exception as error:
+                diag(f"{label} bitmap recycle failed: {error}")
+
+    def _clear_bg_blur(self) -> None:
+        image, bitmap = self._blur_target, self._blur_bitmap
+        if image is not None:
+            try:
+                image.setImageDrawable(None)
+                image.setRenderEffect(None)
+            except Exception as error:
+                diag(f"blur detach failed; leaving displayed bitmap unrecycled: {error}")
+                return
+        self._blur_target = self._blur_bitmap = None
+        self._recycle_owned_bitmap(bitmap, "blur")
+
+
+    # --- iOS slide-to-select (hold finger, drag across, release) ---
+
+    def _view_screen_rect(self, view: Any):
+        try:
+            if view.getWidth() <= 0 or view.getHeight() <= 0:
+                return None
+            arr = jarray(jint)([0, 0])
+            view.getLocationOnScreen(arr)
+            sx, sy, current = 1.0, 1.0, view
+            # Location includes translation; size must include entrance scales
+            # on both the target and its ancestors.
+            for _ in range(24):
+                if current is None or current == self.parent_container_owner():
+                    break
+                sx *= float(_message_call(current, "getScaleX", 1.0))
+                sy *= float(_message_call(current, "getScaleY", 1.0))
+                current = _message_call(current, "getParent", None)
+            return (int(arr[0]), int(arr[1]), int(arr[0] + view.getWidth() * sx), int(arr[1] + view.getHeight() * sy))
+        except Exception as error:
+            diag_once("touch-rect", f"touch rectangle unavailable: {error}")
+            return None
+
+
+    def _pressed_background(self, is_dark):
+        try:
+            colors = jclass("android.content.res.ColorStateList")
+            ripple = jclass("android.graphics.drawable.RippleDrawable")
+            return ripple(colors.valueOf(Color.parseColor("#33FFFFFF" if is_dark else "#22000000")), None, None)
+        except Exception as error:
+            diag_once("row-ripple", f"ripple unavailable; trying pressed drawable: {error}")
+            try:
+                drawable = jclass("android.graphics.drawable.StateListDrawable")()
+                color_drawable = jclass("android.graphics.drawable.ColorDrawable")
+                pressed = jclass("android.R$attr").state_pressed
+                drawable.addState(jarray(jint)([pressed]), color_drawable(Color.parseColor("#3A3A3C" if is_dark else "#E5E5EA")))
+                drawable.addState(jarray(jint)([]), color_drawable(Color.TRANSPARENT))
+                return drawable
+            except Exception as fallback_error:
+                diag_once("row-pressed", f"pressed drawable unavailable: {fallback_error}")
+                return None
+
+    def _cache_hit_rects(self):
+        if not self.is_active():
+            return
+        bar = self._view_screen_rect(self.reaction_bar) if self.reaction_bar is not None else None
+        self._reaction_bar_rect = bar
+        reactions = []
+        for view, _emoji in self.reaction_views:
+            if bar is None:
+                reactions.append(None)
+            else:
+                reactions.append(self._view_screen_rect(view))
+        card = self._view_screen_rect(self.context_menu)
+        scroll_y = int(self.menu_scroll.getScrollY()) if self.menu_scroll is not None else 0
+        rows = []
+        for row, _option in self.menu_rows:
+            rect = self._view_screen_rect(row)
+            rows.append((rect[0], rect[1] + scroll_y, rect[2], rect[3] + scroll_y) if rect else None)
+        self._hit_rects = (reactions, rows, card)
+
+    def _set_menu_highlight(self, idx: int) -> None:
+        for i, (row, _opt) in enumerate(self.menu_rows):
+            try:
+                if i == idx:
+                    if self._menu_is_dark:
+                        row.setBackgroundColor(Color.parseColor("#3A3A3C"))
+                    else:
+                        row.setBackgroundColor(Color.parseColor("#E5E5EA"))
+                else:
+                    background = self._row_backgrounds[i] if i < len(self._row_backgrounds) else None
+                    if background is not None:
+                        row.setBackground(background)
+                    else:
+                        row.setBackgroundColor(Color.TRANSPARENT)
+            except Exception:
+                pass
+
+    def _set_rx_highlight(self, idx: int) -> None:
+        # Grow the glyph, not its touch target. Adjacent hit boxes stay fixed.
+        # Only the previously and newly highlighted glyphs are reset; the rest
+        # keep their entrance wave instead of snapping to full size whenever
+        # the held finger lifts or hovers a menu row.
+        previous, self._rx_highlighted = self._rx_highlighted, idx
+        for i, (container, _emoji) in enumerate(self.reaction_views):
+            try:
+                container.setAlpha(1.0 if idx in (-1, i) else 0.6)
+                if i not in (previous, idx):
+                    continue
+                halo, halo_bg, tv = self.reaction_halos[i]
+                tv.animate().cancel()
+                halo.animate().cancel()
+                container.setScaleX(1.0)
+                container.setScaleY(1.0)
+                tv.setScaleX(1.2 if i == idx else 1.0)
+                tv.setScaleY(1.2 if i == idx else 1.0)
+                halo.setAlpha(1.0 if i == idx else 0.0)
+                halo.setScaleX(1.0)
+                halo.setScaleY(1.0)
+                halo_bg.setColor(Color.parseColor("#33FFFFFF" if self._menu_is_dark else "#22000000"))
+            except Exception:
+                pass
+
+    def _change_hover(self, kind, idx, anchor_view=None) -> None:
+        if kind == self._hover_kind and idx == self._hover_idx:
+            return
+        self._hover_kind, self._hover_idx = kind, idx
+        self._hover_is_super = False
+        self._hover_rx_token += 1
+        self._hover_started = time.monotonic()
+        self._set_menu_highlight(idx if kind == "menu" else -1)
+        self._set_rx_highlight(idx if kind == "rx" else -1)
+        if kind is None:
+            return
+        do_haptic(anchor_view or self.context_menu or self.reaction_bar, "tap", self._hl())
+        if kind != "rx" or not 0 <= idx < len(self.reaction_halos):
+            return
+        token = self._hover_rx_token
+        session_ref = weakref.ref(self)
+
+        def charge_complete():
+            session = session_ref()
+            if (session is None or not session.is_active()
+                    or session._hover_rx_token != token
+                    or session._hover_kind != "rx" or session._hover_idx != idx):
+                return
+            try:
+                session._hover_is_super = True
+                halo, halo_bg, _tv = session.reaction_halos[idx]
+                halo_bg.setColor(Color.parseColor("#55007AFF" if session._menu_is_dark else "#40007AFF"))
+                do_haptic(anchor_view or session.reaction_bar, "heavy", session._hl())
+            except Exception as error:
+                diag_once("reaction-charge-end", f"reaction charge completion unavailable: {error}")
+
+        completion_bound = False
+        if not getattr(self, "_reduce_motion", False):
+            # Android animates these properties natively. No Python callback is
+            # scheduled for each frame, so a held reaction cannot starve draws.
+            # Linear, as ReactionContextNode's long-press highlight transition.
+            try:
+                halo, _halo_bg, tv = self.reaction_halos[idx]
+                for view, target in ((halo, 1.55), (tv, 1.7)):
+                    animator = view.animate()
+                    animator.cancel()
+                    animator.setStartDelay(0)
+                    animator.setDuration(380)
+                    animator.setInterpolator(LinearInterpolator())
+                    animator.withEndAction(None)
+                    animator.scaleX(float(target)).scaleY(float(target))
+                    if view is tv:
+                        # The end action follows Android's animator duration
+                        # scale, so the big-reaction state and haptic land when
+                        # the glyph visibly finishes growing. A cancelled
+                        # animator (hover moved, dismiss) never runs it.
+                        callback = R(charge_complete)
+                        self._motion_callbacks.append(callback)
+                        animator.withEndAction(callback)
+                        completion_bound = True
+                    animator.start()
+            except Exception as error:
+                diag_once("reaction-charge-motion", f"native reaction charge animation unavailable: {error}")
+                completion_bound = False
+        if not completion_bound:
+            run_on_ui_thread(charge_complete, 380)
+
+    def update_hover(self, raw_x: float, raw_y: float, anchor_view: Any = None, during_entrance: bool = False) -> bool:
+        """Highlight whatever is under the finger. Returns True if hovering
+        a commitable item. Fires one crisp tick per highlight change."""
+        if self.is_dismissing or not self._is_active:
+            return False
+        found_kind = None
+        found_idx = -1
+
+        if not during_entrance and self._entrance_running:
+            return False
+        # Build once after layout. MOVE only reads one scroll offset, then
+        # adjusts cached content coordinates and clips to the visible card.
+        if during_entrance and self._entrance_running:
+            self._hit_rects = None
+        if self._hit_rects is None:
+            self._cache_hit_rects()
+        if self._hit_rects is None:
+            return False
+        rx_rects, row_content_rects, card = self._hit_rects
+        scroll_y = int(self.menu_scroll.getScrollY()) if self.menu_scroll is not None else 0
+        menu_rects = []
+        for rect in row_content_rects:
+            if rect and card:
+                shifted = (max(rect[0], card[0]), max(rect[1] - scroll_y, card[1]),
+                           min(rect[2], card[2]), min(rect[3] - scroll_y, card[3]))
+                rect = shifted if shifted[3] > shifted[1] else None
+            else:
+                rect = None
+            menu_rects.append(rect)
+        try:
+            for i, r in enumerate(rx_rects):
+                if r and r[0] <= raw_x <= r[2] and r[1] <= raw_y <= r[3]:
+                    found_kind, found_idx = "rx", i
+                    break
+        except Exception:
+            pass
+        if found_kind is None:
+            try:
+                for i, r in enumerate(menu_rects):
+                    if r and r[0] <= raw_x <= r[2] and r[1] <= raw_y <= r[3]:
+                        found_kind, found_idx = "menu", i
+                        break
+            except Exception:
+                pass
+
+        # Dividers and padding inside each control choose the nearest target.
+        if found_kind is None:
+            bar = getattr(self, "_reaction_bar_rect", None)
+            if bar and bar[0] <= raw_x <= bar[2] and bar[1] <= raw_y <= bar[3]:
+                candidates = [(abs(raw_x - (r[0] + r[2]) / 2), i) for i, r in enumerate(rx_rects) if r]
+                if candidates:
+                    found_kind, found_idx = "rx", min(candidates)[1]
+            elif card and card[0] <= raw_x <= card[2] and card[1] <= raw_y <= card[3]:
+                candidates = [(abs(raw_y - (r[1] + r[3]) / 2), i) for i, r in enumerate(menu_rects) if r]
+                if candidates:
+                    found_kind, found_idx = "menu", min(candidates)[1]
+        self._change_hover(found_kind, found_idx, anchor_view)
+        return found_kind is not None
+
+    def clear_hover(self) -> None:
+        self._hover_rx_token += 1
+        self._hover_is_super = False
+        self._hover_kind, self._hover_idx = None, -1
+        try:
+            self._set_menu_highlight(-1)
+            self._set_rx_highlight(-1)
+        except Exception:
+            pass
+
+    def commit_hover_or_dismiss(self, anchor_view: Any = None) -> None:
+        if not self.is_active():
+            return
+        kind, idx = self._hover_kind, self._hover_idx
+        if kind == "menu" and 0 <= idx < len(self.menu_rows):
+            try:
+                _row, opt_id = self.menu_rows[idx]
+            except Exception:
+                self.dismiss(animated=True)
+                return
+            if self._dispatch_action(int(opt_id)):
+                return
+            self.dismiss(animated=True)
+            return
+        if kind == "rx" and 0 <= idx < len(self.reaction_views):
+            try:
+                _ev, emo = self.reaction_views[idx]
+            except Exception:
+                self.dismiss(animated=True)
+                return
+            is_super = self._hover_is_super
+            if self._dispatch_reaction(str(emo), is_big=is_super):
+                return
+            self.dismiss(animated=False)
+            return
+        # Releasing over no target cancels the highlight and keeps the menu
+        # open (iOS behaviour, and the contract stated for the original
+        # long-press stream). Backdrop, preview and Back still dismiss.
+        self.clear_hover()
+
+    def dismiss(self, animated: bool = True) -> None:
+        global _active_session
+        if self._cleanup_done:
+            return
+        if self.is_dismissing:
+            if not animated:
+                self._cleanup()
+            return
+        self.is_dismissing = True
+        self._is_active = False
+        self._hover_rx_token += 1
+        # Keep the global owner until cleanup detaches the overlay, so native
+        # multiselect stays suppressed throughout the fade.
+        if self._list_forwarder is not None:
+            self._list_forwarder.detach()
+            self._list_forwarder = None
+        plugin = self.plugin_ref() if self.plugin_ref else None
+        if _motion_reduced(plugin, self.parent_container_owner() if self.parent_container_owner else None):
+            animated = False
+        if animated and self.overlay_root is not None:
+            try:
+                self._animate_out()
+                return
+            except Exception as error:
+                diag(f"dismiss animation: {error}")
+        self._cleanup()
+
+
+    def _cleanup(self) -> None:
+        global _active_session
+        if self._cleanup_done or self._cleanup_in_progress:
+            return
+        self._cleanup_in_progress = True
+        self._is_active = False
+        self.is_dismissing = True
+        self._hover_rx_token += 1
+        self._cancel_motion()
+        if self._list_forwarder is not None:
+            self._list_forwarder.detach()
+            self._list_forwarder = None
+        root = self.overlay_root
+        if root is not None:
+            try:
+                root.animate().cancel()
+                root.setVisibility(View.GONE)
+                parent = root.getParent()
+                if parent is not None:
+                    parent.removeView(root)
+            except Exception as error:
+                diag(f"overlay detach: {error}")
+                if root.getParent() is not None:
+                    self._cleanup_in_progress = False
+                    return
+            try:
+                root.setOnKeyListener(None)
+                root.setOnTouchListener(None)
+                root.setOnClickListener(None)
+                root.removeAllViews()
+            except Exception:
+                pass
+        for child, importance in self._a11y_hidden:
+            try:
+                child.setImportantForAccessibility(importance)
+            except Exception as error:
+                diag(f"restoring chat accessibility failed: {error}")
+        self._a11y_hidden.clear()
+        if root is not None and self._layout_listener is not None:
+            try:
+                root.removeOnLayoutChangeListener(self._layout_listener)
+            except Exception as error:
+                diag(f"layout listener detach failed: {error}")
+        self._layout_listener = None
+        self._hit_rects = None
+        for view in [self.preview_image, self.backdrop_view, self.reaction_bar, self.reaction_background,
+                     self.context_menu] + [r for r, _ in self.menu_rows] + [v for v, _ in self.reaction_views]:
+            if view is None:
+                continue
+            try:
+                view.animate().cancel()
+                view.setOnTouchListener(None)
+                view.setOnClickListener(None)
+            except Exception:
+                pass
+        self._clear_bg_blur()
+        if self.preview_image is not None:
+            try:
+                self.preview_image.setImageDrawable(None)
+                self._recycle_owned_bitmap(self.preview_bitmap, "preview")
+                self.preview_bitmap = None
+            except Exception as error:
+                diag(f"preview detach failed; bitmap not recycled: {error}")
+        self._remove_touch_interceptor()
+        for glyph in self._custom_glyphs:
+            try:
+                glyph.setAnimatedEmojiDrawable(None)
+            except Exception as error:
+                diag(f"custom emoji detach failed: {error}")
+        self._custom_glyphs.clear()
+        self._listeners.clear()
+        self._chat_list = None
+        if _active_session is self:
+            _active_session = None
+        self.overlay_root = self.preview_image = self.backdrop_view = None
+        self.reaction_bar = self.reaction_background = self.context_menu = self.menu_scroll = None
+        self._card_bg = self._pill_bg = None
+        self.menu_rows.clear()
+        self._row_backgrounds.clear()
+        self.reaction_views.clear()
+        self.reaction_halos.clear()
+        self.message_obj = self.primary_message = self.edit_caption = None
+        self.native_method = None
+        self.native_items = self.native_args = []
+        self.plugin_ref = self.chat_activity_owner = self.cell_owner = self.parent_container_owner = None
+        self._cleanup_done = True
+        self._cleanup_in_progress = False
+
+
+    def _select_reaction(self, chat_activity: Any, cell: Any,
+                         message_obj: Any, vr: Any, is_big: bool) -> int:
+        # Exact signatures verified in Telegram source; reject unknown flag
+        # order rather than guessing. Never retry InvocationTargetException.
+        common = ["org.telegram.messenger.MessageObject",
+                  "org.telegram.ui.Components.ReactionsContainerLayout", "android.view.View",
+                  "float", "float",
+                  "org.telegram.ui.Components.Reactions.ReactionsLayoutInBubble$VisibleReaction",
+                  "boolean", "boolean", "boolean"]
+        for signature, args in (
+            (["android.view.View"] + common + ["boolean"],
+             [cell, message_obj, None, None, 0.0, 0.0, vr, False, bool(is_big), True, False]),
+            (common, [message_obj, None, None, 0.0, 0.0, vr, False, bool(is_big), True]),
+        ):
+            method = _find_declared_method(chat_activity, "selectReaction", len(signature), signature)
+            if method is None:
+                continue
+            names = [str(p.getName()) for p in _java_array_to_list(method.getParameterTypes())]
+            if names != signature:
+                continue
+            result = _invoke_java_method(method, chat_activity, args)
+            if result == INVOKE_OK and is_big:
+                self._show_big_reaction_effect(chat_activity, message_obj, vr)
+            return result
+        diag("selectReaction: unsupported signature; use More actions")
+        return INVOKE_NOT_RUN
+
+    def _show_big_reaction_effect(self, chat, message, reaction) -> None:
+        # With no native reaction picker attached, selectReaction chooses the
+        # short animation even when bigEmoji=True. Promote the effect that
+        # Telegram just created; this does not send a second reaction.
+        try:
+            effect = jclass("org.telegram.ui.Components.Reactions.ReactionsEffectOverlay")
+            short = effect.currentShortOverlay
+            if short is None or _read_field(short, "reaction") != reaction:
+                return
+            cell = _read_field(short, "cell")
+            if cell is None or cell.getParent() is None:
+                return
+            effect.removeCurrent(True)
+            effect.show(chat, None, cell, None, jfloat(0.0), jfloat(0.0), reaction,
+                        jint(chat.getCurrentAccount()), jint(effect.LONG_ANIMATION))
+            effect.startAnimation()
+        except Exception as error:
+            # Animation failure must never retry a successfully sent reaction.
+            diag(f"big reaction animation unavailable: {error}")
+
+
+    def _dispatch_reaction(self, emoji_char: str, is_big: bool = False) -> bool:
+        if not self.is_active() or not self._message_still_here():
+            return False
+        chat_activity = self.chat_activity_owner() if self.chat_activity_owner else None
+        cell = self.cell_owner() if self.cell_owner else None
+        if chat_activity is None or cell is None:
+            return False
+
+        message_obj = self.message_obj
+        primary = self.primary_message
+        if message_obj is None:
+            return False
+
+        try:
+            if emoji_char not in _allowed_emojis(chat_activity, primary):
+                self.dismiss(animated=False)
+                _notify(chat_activity, "This reaction is no longer available here.")
+                return False
+            vr = _visible_reaction(emoji_char)
+            if vr is None:
+                diag("reaction factory missing; opening native picker through native menu")
+                plugin, args, method = self.plugin_ref(), list(self.native_args), self.native_method
+                self.dismiss(animated=False)
+                return _open_native_menu(plugin, chat_activity, args, method)
+            # Detach the overlay before Telegram opens its reaction animation.
+            plugin, args, method = self.plugin_ref(), list(self.native_args), self.native_method
+            self.dismiss(animated=False)
+            result = self._select_reaction(chat_activity, cell, primary, vr, is_big)
+            if result == INVOKE_OK:
+                log(f"Reaction dispatched: {emoji_char}, is_big={is_big}")
+                return True
+            if result == INVOKE_NOT_RUN and cell.getParent() is not None and _message_call(cell, "getMessageObject", None) == message_obj:
+                return _open_native_menu(plugin, chat_activity, args, method)
+            _notify(chat_activity, "Reaction unavailable. Try More actions for Telegram’s reaction picker.")
+            return False
+        except Exception as e:
+            diag(f"Failed to set reaction via ChatActivity: {e}")
+            return False
+
+    def _dispatch_action(self, option_id: int) -> bool:
+        if not self.is_active() or not self._message_still_here():
+            return False
+        chat = self.chat_activity_owner() if self.chat_activity_owner else None
+        cell = self.cell_owner() if self.cell_owner else None
+        plugin = self.plugin_ref() if self.plugin_ref else None
+        message, caption, args = self.message_obj, self.edit_caption, list(self.native_args)
+        native_method = self.native_method
+        if chat is None or cell is None or plugin is None or message is None:
+            return False
+        if option_id == OPTION_SELECT_MESSAGE:
+            method = _find_declared_method(chat, "startMultiselect", 1, ["int"])
+            position = _message_call(cell, "getAdapterPosition", -1)
+            if int(position) < 0 and self._chat_list is not None:
+                position_method = _find_declared_method(self._chat_list, "getChildAdapterPosition", 1, ["android.view.View"])
+                if position_method is not None:
+                    try:
+                        position = int(position_method.invoke(self._chat_list, jarray(jclass("java.lang.Object"))([cell])))
+                    except Exception as error:
+                        diag(f"select adapter position query failed: {error}")
+            position = int(position)
+            self.dismiss(animated=False)
+            if method is None or position < 0:
+                diag(f"select: exact startMultiselect(int) or adapter position unavailable ({position}); native menu")
+                return _open_native_menu(plugin, chat, args, native_method)
+            result = _invoke_java_method(method, chat, [position])
+            if result == INVOKE_THREW:
+                _notify(chat, "Action could not run. Long-press again and choose More actions.")
+                return False
+            if result == INVOKE_OK and _action_mode_showed(chat):
+                return True
+            diag("select: action mode not showing; opening native menu once")
+            return _open_native_menu(plugin, chat, args, native_method)
+        if option_id == OPTION_NATIVE_MENU:
+            if _message_call(cell, "getMessageObject", None) != message:
+                self.dismiss(animated=False)
+                _notify(chat, "The message moved. Long-press it again to open its menu.")
+                return False
+            self.dismiss(animated=False)
+            return _open_native_menu(plugin, chat, args, native_method)
+        try:
+            # Recheck permissions and message state at commit time.
+            items, caption = _native_items(chat, cell, message)
+            if option_id not in {item[2] for item in items}:
+                self.dismiss(animated=False)
+                _notify(chat, "This action is no longer available for this message.")
+                return False
+            self.dismiss(animated=False)
+            result = safe_invoke_process_selected_option(chat, cell, message, option_id, caption)
+            if result == INVOKE_OK:
+                return True
+            if result == INVOKE_NOT_RUN and cell.getParent() is not None and _message_call(cell, "getMessageObject", None) == message:
+                return _open_native_menu(plugin, chat, args, native_method)
+            _notify(chat, "Action could not run. Long-press again and choose More actions.")
+        except Exception as error:
+            diag(f"action {option_id} failed: {error}")
+            self.dismiss(animated=False)
+            _notify(chat, "Action unavailable. Try More actions.")
+        return False
+
+
+def show_ios_peek_menu(plugin: "IOSPeekMenuPlugin", chat_activity: Any,
+                       cell: Any, native_args: list = None, native_method=None) -> bool:
+    global _active_session
+    dismiss_active_session(animated=False)
+    session = None
+    try:
+        session = PeekMenuSession(plugin, chat_activity, cell)
+        session.native_args = list(native_args or [])
+        session.native_method = native_method
+        try:
+            session.native_items, session.edit_caption = _native_items(chat_activity, cell, session.message_obj)
+        except Exception as error:
+            # Older forks may not expose fillMessageMenu. Still show the
+            # preview and More actions; do not invent permissions or make
+            # this optional method a prerequisite for opening any popup.
+            diag(f"native actions unavailable; showing More actions: {error}")
+            session.native_items, session.edit_caption = [], None
+        _active_session = session
+        session.show()
+        shown = session.is_active() and session.overlay_root is not None and session.overlay_root.getParent() is not None
+        if shown:
+            diag(f"popup attached: {len(session.menu_rows)} action rows")
+            do_haptic(cell, "show", haptic_level_for(plugin))
+        elif session._show_failed:
+            _notify(chat_activity, "Peek could not open. Copy diagnostics from the plugin settings.")
+        return bool(shown)
+    except Exception as error:
+        diag(f"popup creation failed; allowing native menu: {error}")
+        if session is not None:
+            session.dismiss(animated=False)
+        _notify(chat_activity, "Peek could not open. Copy diagnostics from the plugin settings.")
+        return False
+
+
+# --- Method Hooks ---
+
+
+class ChatActivityCreateMenuHook(MethodHook):
+    def __init__(self, plugin: "IOSPeekMenuPlugin"):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param: Any) -> None:
+        if param is None or not self.plugin.get_setting("enabled", True):
+            return
+        if getattr(self.plugin, "_native_bypass", 0):
+            return
+        try:
+            # createMenu is a UI callback. If this changes in a fork, native
+            # handling remains intact instead of mutating views off-thread.
+            if Looper.myLooper() != Looper.getMainLooper():
+                return
+            args = _java_array_to_list(param.args)
+            if len(args) < 2 or _as_bool(args[1]):
+                return
+            # Telegram's didLongPress(cell, x, y) calls the six-argument
+            # createMenu overload with False in its last slot. It is not a
+            # reliable gesture-origin test. Accept both values here.
+            if len(args) >= 8 and _as_bool(args[7]):
+                return
+            chat, cell = param.thisObject, args[0]
+            global _cell_class
+            if _cell_class is None:
+                _cell_class = find_class("org.telegram.ui.Cells.ChatMessageCell")
+            if not _is_java_instance(cell, _cell_class):
+                return
+            if _action_mode_showed(chat) or _message_call(chat, "isReport", False) or int(_read_field(chat, "reportType", -1)) >= 0:
+                return
+            diag(f"createMenu: eligible message hold, overload={len(args)}")
+            message = _message_call(cell, "getMessageObject", None)
+            if (message is None or _message_call(message, "isSponsored", False)
+                    or _message_call(message, "isSecretMedia", False)
+                    or _message_call(message, "isSendError", False)
+                    or _message_call(message, "isSending", False)
+                    or _message_call(message, "isEditing", False)):
+                return
+            if is_session_active():
+                session = _active_session
+                if session.chat_activity_owner() == chat and session.message_obj == message:
+                    param.setResult(True)
+                    return
+            if show_ios_peek_menu(self.plugin, chat, cell, args, getattr(param, "method", None)):
+                try:
+                    param.setResult(True)
+                except Exception as error:
+                    diag(f"createMenu result suppression failed; removing peek before native method: {error}")
+                    session = _active_session
+                    if session is not None:
+                        session.dismiss(animated=False)
+        except Exception as error:
+            diag(f"createMenu hook: {error}; allowing native menu")
+            session = _active_session
+            if session is not None and session.chat_activity_owner and session.chat_activity_owner() == getattr(param, "thisObject", None):
+                session.dismiss(animated=False)
+
+
+class ChatActivityStartMultiselectHook(MethodHook):
+    """
+    THE core iOS-parity fix: Telegram's long-press path ALWAYS calls
+    createMenu() AND startMultiselect(). Suppressing only createMenu still
+    leaves checkmarks / action-mode behind. This kills that second half
+    whenever a peek just triggered or is showing.
+    void startMultiselect(int position)
+    """
+
+    def __init__(self, plugin: "IOSPeekMenuPlugin"):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param: Any) -> None:
+        if param is None:
+            return
+        if not self.plugin.get_setting("enabled", True):
+            return
+        if should_suppress_select(param.thisObject):
+            try:
+                param.setResult(None)
+            except Exception:
+                pass
+
+
+class RecyclerListViewStartMultiselectHook(MethodHook):
+    """
+    Prevents RecyclerListView from entering multiSelectionGesture mode
+    when the iOS peek menu is active or just triggered.
+    void startMultiselect(int positionFrom, boolean useRelativePositions, onMultiSelectionChanged multiSelectionListener)
+    """
+
+    def __init__(self, plugin: "IOSPeekMenuPlugin"):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param: Any) -> None:
+        if param is None:
+            return
+        if not self.plugin.get_setting("enabled", True):
+            return
+        if should_suppress_select(param.thisObject):
+            try:
+                param.setResult(None)
+            except Exception:
+                pass
+
+
+class ChatActivityProcessRowSelectHook(MethodHook):
+    """
+    Same reason: OnItemLongClick falls through to
+    processRowSelect(view, outside, x, y) when action mode is on.
+    Suppress it during peek so rows never get checkmarks.
+    void processRowSelect(View view, boolean outside, float x, float y)
+    """
+
+    def __init__(self, plugin: "IOSPeekMenuPlugin"):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param: Any) -> None:
+        if param is None:
+            return
+        if not self.plugin.get_setting("enabled", True):
+            return
+        if should_suppress_select(param.thisObject):
+            try:
+                param.setResult(None)
+            except Exception:
+                pass
+
+
+class ChatActivityOnBackPressedHook(MethodHook):
+    """
+    Auto-dismiss overlay when Android Back button is pressed.
+    """
+
+    def __init__(self, plugin: "IOSPeekMenuPlugin"):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param: Any) -> None:
+        if should_suppress_select(param.thisObject):
+            args = _java_array_to_list(param.args)
+            method = getattr(param, "method", None)
+            if method is not None:
+                names = [str(p.getName()) for p in _java_array_to_list(method.getParameterTypes())]
+                if names not in ([], ["boolean"]):
+                    return
+            elif len(args) > 1 or (args and not isinstance(args[0], bool)):
+                diag_once("back-signature", "unidentified back overload left native")
+                return
+            # Modern Telegram first queries with invoked=False. Consume the
+            # query but dismiss only when the back gesture is committed.
+            if not args or _as_bool(args[0]):
+                dismiss_active_session(animated=True)
+            try:
+                param.setResult(False)
+            except Exception as error:
+                diag(f"back consumption failed: {error}")
+
+
+class ChatActivityOnConfigChangedHook(MethodHook):
+    """
+    Auto-dismiss overlay immediately on screen rotation or resize.
+    """
+
+    def __init__(self, plugin: "IOSPeekMenuPlugin"):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param: Any) -> None:
+        if should_suppress_select(param.thisObject):
+            dismiss_active_session(animated=False)
+
+
+class ChatActivityOnDestroyHook(MethodHook):
+    """
+    Auto-dismiss overlay immediately when the chat fragment is paused or destroyed.
+    """
+
+    def __init__(self, plugin: "IOSPeekMenuPlugin"):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param: Any) -> None:
+        if should_suppress_select(param.thisObject):
+            dismiss_active_session(animated=False)
+
+
+# --- BasePlugin Implementation ---
+
+
+class IOSPeekMenuPlugin(BasePlugin):
+    """
+    Main plugin class registered with exteraGram.
+    """
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text=ui_text('General')),
+            Switch(
+                key="enabled",
+                text=ui_text('Enable iOS Peek & Pop Menu'),
+                default=True,
+                on_change=lambda value: run_on_ui_thread(lambda: dismiss_active_session(animated=False)),
+                subtext=ui_text('Replaces default long press menu with iOS-style overlay'),
+            ),
+            Switch(
+                key="enable_reactions",
+                text=ui_text('Floating Reaction Bar'),
+                default=True,
+                subtext=ui_text('Display quick reaction emoji pill above or below message'),
+            ),
+            Selector(
+                key="haptic_intensity",
+                text=ui_text('Haptic Intensity'),
+                default=2,
+                items=[ui_text(t) for t in ["Off", "Light", "Medium", "Strong"]],
+            ),
+            Divider(),
+            Header(text=ui_text('Appearance & Physics')),
+            Switch(key="reduce_motion", text=ui_text('Reduce motion'), default=False,
+                   subtext=ui_text('Show and dismiss immediately without spring animations')),
+            Switch(key="slide_select", text=ui_text('Slide to select'), default=True,
+                   subtext=ui_text('Drag across actions; compact screens use scrolling instead')),
+            Switch(
+                key="blur_backdrop",
+                text=ui_text('Frosted Background Blur'),
+                default=True,
+                subtext=ui_text('Hardware accelerated blur behind overlay (Android 12+)'),
+            ),
+            Selector(
+                key="blur_intensity",
+                text=ui_text('Blur Intensity'),
+                default=2,
+                items=[ui_text(t) for t in ["Subtle", "Medium", "Heavy / iOS", "Extreme"]],
+            ),
+            Switch(
+                key="spring_physics",
+                text=ui_text('Spring Overshoot Physics'),
+                default=True,
+                subtext=ui_text('Fluid iOS-style bounce animation on menu appearance'),
+            ),
+            Divider(),
+            Text(text=ui_text('Copy diagnostics'), icon="msg_copy", on_click=self.copy_diagnostics),
+        ]
+
+    def copy_diagnostics(self, view=None):
+        try:
+            copy_to_clipboard(diag_dump())
+            if view is not None:
+                Toast.makeText(view.getContext(), tr("TextCopied", "Diagnostics copied"), Toast.LENGTH_SHORT).show()
+        except Exception as error:
+            diag(f"copy diagnostics failed: {error}")
+
+    def on_plugin_load(self) -> None:
+        # Each hook is registered independently: a single missing method
+        # (or a renamed one in a new Telegram build) previously aborted the
+        # whole try-block and left the plugin completely inert.
+        self._native_bypass = 0
+        registered = 0
+        failed = 0
+        _load_diagnostics.clear()
+        _method_cache.clear()
+        _diag_once_keys.clear()
+        load_diag(f"=== plugin {__version__} loading ===")
+
+        def _hook_all(target: Any, method: str, hook: Any) -> None:
+            nonlocal registered, failed
+            if target is None:
+                failed += 1
+                load_diag(f"hook {method}: target class not found")
+                return
+            try:
+                result = self.hook_all_methods(target, method, hook)
+                if result is not None:
+                    try:
+                        count = len(result)
+                    except Exception:
+                        try:
+                            count = int(result.size())
+                        except Exception:
+                            count = None
+                    if count == 0:
+                        failed += 1
+                        load_diag(f"hook {method}: ZERO matching methods (possibly inherited)")
+                        return
+                    load_diag(f"hook {method}: registered ({count if count is not None else 'unknown'} matches)")
+                else:
+                    load_diag(f"hook {method}: SDK returned no registration count; unverified")
+                registered += 1
+            except Exception as e:
+                failed += 1
+                load_diag(f"hook {method}: FAILED {type(e).__name__}: {e}")
+
+        def _hook_exact(target, name, signature, hook):
+            nonlocal registered, failed
+            method = _find_declared_method(target, name, len(signature), signature)
+            if method is None:
+                failed += 1
+                load_diag(f"hook {name}{signature}: exact overload unavailable")
+                return
+            try:
+                handle = self.hook_method(method, hook)
+                if handle is None:
+                    failed += 1
+                    load_diag(f"hook {name}{signature}: registration unconfirmed")
+                    return
+                registered += 1
+                load_diag(f"hook {name}{signature}: registered")
+            except Exception as error:
+                failed += 1
+                load_diag(f"hook {name}{signature}: FAILED {error}")
+
+        try:
+            ChatActivity = find_class("org.telegram.ui.ChatActivity")
+            _hook_all(ChatActivity, "createMenu", ChatActivityCreateMenuHook(self))
+            # iOS parity: these two are what cause the multi-select
+            # checkmarks you saw even when the menu was suppressed.
+            _hook_all(ChatActivity, "startMultiselect", ChatActivityStartMultiselectHook(self))
+            _hook_all(ChatActivity, "processRowSelect", ChatActivityProcessRowSelectHook(self))
+            for signature in ([], ["boolean"]):
+                _hook_exact(ChatActivity, "onBackPressed", signature, ChatActivityOnBackPressedHook(self))
+            _hook_all(ChatActivity, "onConfigurationChanged", ChatActivityOnConfigChangedHook(self))
+            _hook_all(ChatActivity, "onFragmentDestroy", ChatActivityOnDestroyHook(self))
+            # The overlay lives on the activity window, not the fragment. Pausing
+            # the chat (app backgrounded, or another fragment pushed over it,
+            # e.g. from a notification) must remove it; 2.0.5 had this hook.
+            _hook_all(ChatActivity, "onPause", ChatActivityOnDestroyHook(self))
+
+            RecyclerListView = find_class("org.telegram.ui.Components.RecyclerListView")
+            _hook_all(
+                RecyclerListView, "startMultiselect", RecyclerListViewStartMultiselectHook(self)
+            )
+
+            if registered:
+                self.log(
+                    f"iOS Peek & Context Menu loaded ({registered} hooks, {failed} failed)."
+                )
+            else:
+                self.log("iOS Peek & Context Menu: no hooks registered (Telegram API changed?)")
+
+        except Exception as e:
+            self.log(f"Failed to register hooks for iOS Peek Menu: {e}")
+
+    def on_plugin_unload(self) -> None:
+        try:
+            def finish():
+                dismiss_active_session(animated=False)
+            run_on_ui_thread(finish)
+
+            self.log("iOS Peek & Context Menu plugin unloaded.")
+        except Exception as e:
+            self.log(f"Error during plugin unload: {e}")
+
+    # NOTE: the measured BasePlugin attribute list from extera_probe contains
+    # neither `on_settings_changed` nor `on_disable`. They are implemented here
+    # only because some loader revisions call them; do NOT rely on either.
+    # The only confirmed teardown path is on_plugin_unload.
+    def on_settings_changed(self) -> None:
+        try:
+            run_on_ui_thread(lambda: dismiss_active_session(animated=False))
+        except Exception:
+            pass
+
+    def on_disable(self) -> None:
+        self.on_plugin_unload()
